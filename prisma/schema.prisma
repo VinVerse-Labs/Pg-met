@@ -1,0 +1,279 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+// Platform-wide role. SUPER_ADMIN is the only role that is meaningful without
+// an OrganizationMembership (internal platform operators). Every other role
+// is granted per-organization via OrganizationMembership.role.
+enum PlatformRole {
+  SUPER_ADMIN
+  USER
+}
+
+enum MembershipRole {
+  OWNER
+  MANAGER
+  STAFF
+  STUDENT
+}
+
+enum MembershipStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum PropertyStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum RoomStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum BedStatus {
+  ACTIVE
+  INACTIVE
+  MAINTENANCE
+}
+
+enum TenantStatus {
+  ACTIVE
+  INACTIVE
+  CHECKED_OUT
+}
+
+// ACTIVE = currently occupying the bed. Every other status is historical.
+// Exactly one ACTIVE allocation may exist per bed, and exactly one ACTIVE
+// allocation may exist per tenant - enforced by partial unique indexes
+// added in a follow-up migration (see migration.sql comments).
+enum BedAllocationStatus {
+  ACTIVE
+  ENDED
+  CANCELLED
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+// Represents a person's identity, independent of any organization or role.
+// Authorization (what a user can do, in which organization) lives entirely
+// in OrganizationMembership - never add a global "role" field here.
+model User {
+  id           String       @id @default(uuid())
+  phone        String?      @unique
+  email        String?      @unique
+  name         String
+  passwordHash String?
+  platformRole PlatformRole @default(USER)
+  status       UserStatus   @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships   OrganizationMembership[]
+  refreshTokens RefreshToken[]
+  tenant        Tenant?
+
+  @@map("users")
+}
+
+// Opaque refresh token record. We never store the raw token, only a hash of
+// it, so a leaked database dump cannot be used to forge sessions. Storing
+// tokens (rather than trusting the JWT alone) is what makes revocation and
+// "logout everywhere" possible.
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Multi-tenancy
+// ---------------------------------------------------------------------------
+
+// The billable SaaS tenant. Owns one or more Properties. All business data
+// (properties, rooms, beds, tenants, ...) is scoped to an Organization.
+model Organization {
+  id     String         @id @default(uuid())
+  name   String
+  status PropertyStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships OrganizationMembership[]
+  properties  Property[]
+  tenants     Tenant[]
+
+  @@map("organizations")
+}
+
+// Join model between User and Organization carrying the role. A single user
+// can hold different roles in different organizations (e.g. OWNER of one PG
+// business, STAFF in another), and a single organization has many members.
+model OrganizationMembership {
+  id             String           @id @default(uuid())
+  userId         String
+  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId String
+  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  role           MembershipRole
+  status         MembershipStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // A user has exactly one membership (one role) per organization.
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+  @@map("organization_memberships")
+}
+
+// ---------------------------------------------------------------------------
+// Property / Room / Bed
+// ---------------------------------------------------------------------------
+
+model Property {
+  id             String         @id @default(uuid())
+  organizationId String
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  addressLine1   String
+  addressLine2   String?
+  city           String
+  state          String
+  postalCode     String
+  status         PropertyStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  rooms Room[]
+
+  @@index([organizationId])
+  @@map("properties")
+}
+
+model Room {
+  id         String     @id @default(uuid())
+  propertyId String
+  property   Property   @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  name       String
+  floor      Int?
+  status     RoomStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  beds Bed[]
+
+  // Room names/numbers only need to be unique within a property.
+  @@unique([propertyId, name])
+  @@index([propertyId])
+  @@map("rooms")
+}
+
+model Bed {
+  id     String    @id @default(uuid())
+  roomId String
+  room   Room      @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  label  String
+  status BedStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  allocations BedAllocation[]
+
+  @@unique([roomId, label])
+  @@index([roomId])
+  @@map("beds")
+}
+
+// ---------------------------------------------------------------------------
+// Tenants & bed allocation history
+// ---------------------------------------------------------------------------
+
+// A Tenant is the PG-business record for a person staying at a property.
+// It is intentionally separate from User: a tenant may exist before they
+// ever create a login (e.g. added by an owner during offline check-in), and
+// linking to User is optional until the student app onboards them.
+model Tenant {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String?      @unique
+  user           User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  name           String
+  phone          String
+  email          String?
+  status         TenantStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  allocations BedAllocation[]
+
+  @@index([organizationId])
+  @@map("tenants")
+}
+
+// Full history of which tenant occupied which bed and when. We never
+// overwrite this record or store a single "currentBedId" on Tenant/Bed -
+// that would destroy history and make "who lived where, when" unanswerable.
+//
+// Concurrency safety: two partial unique indexes are added by hand in the
+// generated migration SQL (Prisma's schema DSL cannot express a WHERE
+// clause on a unique index):
+//   CREATE UNIQUE INDEX bed_allocations_active_bed_unique
+//     ON bed_allocations (bed_id) WHERE status = 'ACTIVE';
+//   CREATE UNIQUE INDEX bed_allocations_active_tenant_unique
+//     ON bed_allocations (tenant_id) WHERE status = 'ACTIVE';
+// These guarantee, at the database level, that a bed can have at most one
+// active occupant and a tenant can hold at most one active allocation, even
+// under concurrent check-in requests. The allocation service additionally
+// wraps check-in/checkout/transfer in a single Prisma transaction so a
+// partial write (e.g. ending the old allocation but failing to create the
+// new one) can never be persisted.
+model BedAllocation {
+  id        String              @id @default(uuid())
+  tenantId  String
+  tenant    Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  bedId     String
+  bed       Bed                 @relation(fields: [bedId], references: [id], onDelete: Cascade)
+  startDate DateTime
+  endDate   DateTime?
+  status    BedAllocationStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId])
+  @@index([bedId])
+  @@map("bed_allocations")
+}

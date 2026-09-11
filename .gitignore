@@ -1,0 +1,36 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+build/
+
+# env
+.env
+.env.*.local
+.env.local
+
+# logs
+logs/
+*.log
+npm-debug.log*
+
+# coverage
+coverage/
+*.lcov
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# prisma
+prisma/*.db
+
+# misc
+*.tsbuildinfo
+.eslintcache
