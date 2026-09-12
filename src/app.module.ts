@@ -11,6 +11,9 @@ import { appConfig, jwtConfig } from './config/configuration';
 import { envValidationSchema } from './config/env.validation';
 import { PrismaModule } from './database/prisma.module';
 import { HealthModule } from './health/health.module';
+import { AuthModule } from './modules/auth/auth.module';
+import { UsersModule } from './modules/users/users.module';
+import { IdentityVerificationModule } from './modules/identity-verification/identity-verification.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { RequestIdMiddleware } from './common/middleware/request-id.middleware';
@@ -36,6 +39,9 @@ import { HttpStatus } from '@nestjs/common';
     ]),
     PrismaModule,
     HealthModule,
+    UsersModule,
+    AuthModule,
+    IdentityVerificationModule,
   ],
   providers: [
     {

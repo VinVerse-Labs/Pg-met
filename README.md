@@ -7,14 +7,18 @@ This repository is backend-only. The mobile apps (owner/manager and
 student) are separate React Native / Expo projects and are not part of
 this codebase.
 
-## Status: Phase 0 - Foundation
+## Status: Phase 1 - Platform Identity, Authentication & KYC Foundation
 
-What exists today is the production-quality *foundation* the rest of the
-product is built on: project setup, configuration, database connectivity,
-the core multi-tenant data model, global error handling, health checks and
-tooling. It intentionally does **not** yet include auth endpoints, rent,
-payments, complaints, food, or student-facing features - those come in
-later phases (see "Roadmap" below).
+Phase 0 delivered the foundation: project setup, configuration, database
+connectivity, the core multi-tenant data model, global error handling,
+health checks and tooling.
+
+Phase 1 (this repository, current) adds platform user identity, JWT
+authentication with refresh-token rotation, multi-device sessions, and the
+identity-verification (KYC) domain foundation. It intentionally does
+**not** yet include organization/property-level authorization, PG
+applications, residency/check-in, rent, payments, complaints, food, or
+notifications - those come in later phases (see "Roadmap" below).
 
 ## Tech stack
 
@@ -144,15 +148,18 @@ src/
 │   └── middleware/              # RequestIdMiddleware - per-request tracing ID
 ├── config/                 # Environment loading + Joi validation (fail fast on boot)
 ├── database/               # PrismaService/PrismaModule - the only way to reach Postgres
-└── health/                 # GET /api/v1/health
+├── health/                 # GET /api/v1/health
+└── modules/
+    ├── users/               # UsersService - the only code that reads/writes the `users` table
+    ├── auth/                # Login/register/refresh/logout, JWT strategy/guard, token + password services
+    └── identity-verification/  # KYC domain foundation (no HTTP endpoints yet - see below)
 ```
 
-`modules/` (auth, users, organizations, properties, rooms, beds, tenants,
-rent, payments, complaints, food, announcements, notifications,
-subscriptions) does not exist yet - it is added incrementally, one module
-per phase, starting with `auth` in Phase 1. Creating empty module shells
-ahead of the code that belongs in them would just be structure for its
-own sake.
+`organizations, properties, rooms, beds, tenants, rent, payments,
+complaints, food, announcements, notifications, subscriptions` do not
+exist as modules yet - they are added incrementally, one module per phase.
+Creating empty module shells ahead of the code that belongs in them would
+just be structure for its own sake.
 
 ### Key decisions and why
 
@@ -210,7 +217,7 @@ own sake.
   enough real nullability (optional email, nullable `endDate`, ...) that
   loose null checking would hide real bugs.
 
-## Data model (Phase 0)
+## Data model (Phase 0 + Phase 1)
 
 ```
 Organization
@@ -222,13 +229,20 @@ Organization
 
 User ──< OrganizationMembership >── Organization
 User ──(optional, 1:1)── Tenant
-User ──< RefreshToken
+User ──< RefreshToken            (Phase 1: one row per active session/device)
+User ──< IdentityVerification    (Phase 1: KYC foundation)
 ```
 
 - `User` is pure identity (phone/email/name/password hash). It has no
-  role field - see "Key decisions" above.
+  role field and no property/room/bed field - see "Key decisions" above
+  and "Phase 1: authentication & identity architecture" below.
 - `Tenant` is intentionally separate from `User`: an owner can check a
   tenant in before that person ever creates a login.
+- `RefreshToken.tokenHash` is a SHA-256 hash - the raw refresh token is
+  never persisted. `revokedAt`/`lastUsedAt` support rotation, reuse
+  detection, and multi-device sessions (see below).
+- `IdentityVerification` is its own table, deliberately never a boolean on
+  `User`/`Tenant` - see "KYC / identity verification foundation" below.
 - `BedAllocation.status` is `ACTIVE | ENDED | CANCELLED`. Concurrency
   safety for "one bed, one active occupant" is enforced by a partial
   unique index (see "A note on the bed allocation constraint" above), not
@@ -236,7 +250,8 @@ User ──< RefreshToken
 - `PrismaClientKnownRequestError` (Prisma's own error type, e.g. a unique
   constraint violation) is mapped to the standard error envelope
   automatically by `AllExceptionsFilter` - a future module doesn't need
-  its own try/catch for that.
+  its own try/catch for that (this is what Phase 1's duplicate
+  email/phone handling relies on).
 
 ## Roles
 
@@ -249,20 +264,25 @@ controllers.
 
 ## Testing strategy
 
-- `src/**/*.spec.ts` - unit tests, run with `npm test`. Currently covers
-  `AllExceptionsFilter`, the single place all error responses are
-  produced - this is the highest-leverage piece of business/security
-  logic that exists in Phase 0.
+- `src/**/*.spec.ts` - unit tests, run with `npm test`. Covers
+  `AllExceptionsFilter` (Phase 0's highest-leverage error-handling logic),
+  and, as of Phase 1: `AuthService` (login/register/refresh
+  rotation/reuse-detection/logout, all edge cases from the spec),
+  `TokenService` (payload minimality, secret isolation between access and
+  refresh tokens, hash determinism), `IdentityVerificationService` (every
+  valid and invalid state transition), and the email/phone normalization
+  helpers.
 - `test/*.e2e-spec.ts` - HTTP-level tests, run with `npm run test:e2e`.
-  `PrismaService` is overridden with a mock in every e2e test so the
-  suite does not require a running database; it verifies routing, the
-  global prefix, the `ValidationPipe`, and both response envelopes
-  end-to-end.
-- Auth, authorization and cross-organization isolation tests are
-  deliberately **not** written yet - those modules don't exist until
-  Phase 1/2, and a test for code that doesn't exist is a test for
-  nothing. They are called out explicitly here so they aren't forgotten
-  once that code lands.
+  `PrismaService` is overridden with an in-memory fake in every e2e test
+  so the suite does not require a running database; `auth.e2e-spec.ts`
+  exercises the full register → login → `/me` → refresh-rotation →
+  reuse-detection → logout flow through real HTTP, guards, and the global
+  response envelope.
+- Authorization and cross-organization isolation tests are deliberately
+  **not** written yet - `OrganizationMembership`-based authorization
+  doesn't exist until Phase 2, and a test for code that doesn't exist is a
+  test for nothing. Called out explicitly here so it isn't forgotten once
+  that code lands.
 
 ## Environment variables
 
@@ -270,10 +290,145 @@ See `.env.example` for the full list. All of them are validated at
 startup (`src/config/env.validation.ts`); the app refuses to boot if a
 required one is missing or malformed.
 
+## Phase 1: authentication & identity architecture
+
+### The core principle: a person is a platform user, not a PG
+
+A `User` is a global identity. It is never tied to a specific PG, property,
+room, or bed - there is no `propertyId`/`roomId`/`bedId` on `User`, and
+there never will be. Where someone currently lives is a fact recorded by
+the *residency* domain (Phase 4+), which a user can enter and leave
+repeatedly over time without ever getting a new account:
+
+```
+User (U1001, "Rahul")
+  ↓
+Identity Verification   - "has this person's identity been verified?"
+  ↓
+PG Application          - "has this person applied to stay at this PG?"
+  ↓
+Residency               - "is this person currently staying at this PG?"
+```
+
+Each stage in that diagram is a **separate concept with its own record**.
+Being authenticated does not mean verified; being verified does not mean
+a tenant anywhere; applying does not mean accepted; a visit does not mean
+either. Only a future check-in workflow (Phase 4) creates a `Residency`/
+`BedAllocation` row, and that is the *only* thing that means "this person
+currently lives here." A user can hold an `ACTIVE` allocation at PG A,
+check out, and later apply to and check in at PG B - same `User.id`
+throughout, a brand new residency record each time.
+
+### Authentication architecture
+
+- **Password auth today, OTP-ready by design.** `User.passwordHash` is
+  nullable specifically so a future OTP-only user (identity proven by a
+  phone code, never a password) can exist without a schema change or a
+  parallel user table. `AuthService.login` already refuses to authenticate
+  a user with no password hash (rather than crashing on `argon2.verify`),
+  which is exactly the branch a future OTP flow slots in next to.
+- **Argon2id** (`PasswordService`) hashes passwords; the hash is never
+  returned by any endpoint, logged, or placed in a JWT.
+- **Account enumeration is avoided on purpose.** A nonexistent account, a
+  user with no password set, and a wrong password all produce the exact
+  same `401 INVALID_CREDENTIALS` response. Account *status* (suspended/
+  inactive) is only revealed **after** the password has already been
+  confirmed correct - by that point the caller has already proven they
+  hold the credential, so it is no longer an oracle for guessing whether
+  an account exists.
+- **`JwtAuthGuard`** (`@UseGuards(JwtAuthGuard)`) protects routes;
+  **`@CurrentUser()`** reads the safe, database-fresh user object it
+  attaches to the request - never the raw JWT payload.
+
+### Access token lifecycle
+
+- Payload is **`{ sub: userId }` only** - no password, role, KYC status,
+  room/bed/property data, or other sensitive profile fields ever go in a
+  JWT. Anything else a protected route needs is loaded fresh from the
+  database.
+- Short-lived (`JWT_ACCESS_EXPIRES_IN`, default `15m`), signed with
+  `JWT_ACCESS_SECRET`.
+- **`JwtStrategy.validate()` re-reads the user from the database on every
+  request** and rejects if the user is missing or not `ACTIVE`. This is
+  what makes "account suspended after a token was already issued" take
+  effect within one access-token lifetime instead of waiting for the much
+  longer-lived refresh token to expire.
+
+### Refresh token lifecycle & rotation
+
+- One `RefreshToken` row per issued refresh token = one row per active
+  login session/device. Only a **SHA-256 hash** of the token is ever
+  stored (`TokenService.hashToken`) - a database leak alone cannot be used
+  to forge a session.
+- **Rotation, not reuse:** every call to `POST /auth/refresh` revokes the
+  presented row and creates a brand-new one in the same database
+  transaction (`AuthService.rotateRefreshToken`). A row is never flipped
+  back to "unrevoked."
+- **Reuse detection:** presenting a refresh token whose row is already
+  `revokedAt != null` is treated as token theft, not a normal error. The
+  handler revokes **every other active session for that user** and
+  returns `TOKEN_REVOKED` - the affected user is forced to re-authenticate
+  on every device, which is the safe default when a stolen refresh token
+  is suspected. There is no explicit "token family" column; grouping by
+  `userId` is the simpler, equally effective mechanism given nothing else
+  in Phase 1 needs a finer-grained family concept.
+- **Concurrent refresh requests** for the same token are handled by a
+  compare-and-swap: the revoke step is a conditional `updateMany` that
+  only succeeds for rows still `revokedAt: null`. At most one concurrent
+  request can win; the other sees `count === 0` and gets the same
+  `TOKEN_REVOKED` response a reused token would produce (from its point of
+  view, it cannot tell the difference, so it isn't told a different lie).
+
+### Multi-device sessions
+
+Each login/register call creates one independent `RefreshToken` row.
+Logging out (`POST /auth/logout`) revokes only the **one** row matching
+the presented token - other devices' sessions are untouched. A future
+"log out everywhere" endpoint is a one-line addition
+(`prisma.refreshToken.updateMany({ where: { userId, revokedAt: null } })`,
+already used internally for reuse detection) and needs no schema change.
+
+### KYC / identity verification foundation
+
+`IdentityVerification` is a **separate table**, never a boolean on `User`
+or `Tenant`. Fields are provider-agnostic (`provider`, `providerReference`)
+so a real KYC vendor integration (DigiLocker, an Aadhaar-eKYC provider,
+...) can be added later without a schema change - and so this repository
+never stores a raw government ID number or document image. Status is a
+state machine (`NOT_STARTED → PENDING → VERIFIED/FAILED → ...`), enforced
+in `IdentityVerificationService`/`identity-verification.transitions.ts`,
+not by a database CHECK constraint (transition policy is product policy,
+and will evolve).
+
+`IdentityVerificationService.start()` **reuses a still-valid `VERIFIED`
+record** for the same user + verification type instead of creating a
+duplicate - this is what lets a user who moves from PG A to PG B skip
+re-verification by default. A specific PG that requires additional/fresh
+verification calls `start(userId, type, { force: true })` explicitly; that
+policy decision belongs to the PG-application domain in a later phase, not
+to this foundation.
+
+No HTTP endpoints are wired up for this domain yet - nothing in Phase 1
+triggers a real verification (that arrives with the PG-application flow).
+What Phase 1 establishes is the *shape* of the domain so later phases
+attach to it instead of retrofitting KYC state onto `User` or `Tenant`.
+
+### Roles stay out of `User` and out of authentication
+
+`SUPER_ADMIN` (platform-level, `User.platformRole`) is the only role
+meaningful without an organization. `OWNER`/`MANAGER`/`STAFF`/`STUDENT` are
+**not** columns on `User` - they will only ever be recorded on
+`OrganizationMembership.role` (Phase 2), scoped to one organization. Two
+different users can hold different roles in the same organization, and
+the same user can hold different roles in different organizations. Auth
+(`AuthService`/`JwtAuthGuard`) only ever answers "who is this user" -
+"what can this user do" is entirely Phase 2's concern.
+
 ## Roadmap
 
-Phase 0 (this repository, done) → Phase 1: auth + users + roles → Phase 2:
-organizations + properties + authorization → Phase 3: rooms + beds →
-Phase 4: tenants + bed allocation → Phase 5: rent + invoices → Phase 6:
-payments → Phase 7: complaints → Phase 8: food/menu → Phase 9:
+Phase 0 (done) → Phase 1 (this repository, done): platform identity, auth,
+sessions, KYC foundation → Phase 2: organizations + properties +
+authorization (`OrganizationMembership`-based) → Phase 3: rooms + beds →
+Phase 4: tenants + bed allocation/residency → Phase 5: rent + invoices →
+Phase 6: payments → Phase 7: complaints → Phase 8: food/menu → Phase 9:
 notifications → Phase 10: subscriptions/billing.

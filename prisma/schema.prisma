@@ -37,6 +37,28 @@ enum MembershipStatus {
   INACTIVE
 }
 
+// Extensible on purpose - identity/KYC is not Aadhaar-specific. New checks
+// (e.g. a future selfie/liveness check) are new enum values, never a new
+// boolean field bolted onto User or Tenant.
+enum IdentityVerificationType {
+  GOVERNMENT_ID
+  ADDRESS_VERIFICATION
+  AGE_VERIFICATION
+}
+
+// NOT_STARTED/PENDING/VERIFIED/FAILED/EXPIRED/REVOKED. Valid transitions are
+// enforced in application code (IdentityVerificationService), not by a
+// database CHECK constraint - the rules (e.g. FAILED -> PENDING allowed for
+// a retry, REVOKED is terminal) are product policy that will evolve.
+enum IdentityVerificationStatus {
+  NOT_STARTED
+  PENDING
+  VERIFIED
+  FAILED
+  EXPIRED
+  REVOKED
+}
+
 enum PropertyStatus {
   ACTIVE
   INACTIVE
@@ -88,28 +110,80 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  memberships   OrganizationMembership[]
-  refreshTokens RefreshToken[]
-  tenant        Tenant?
+  memberships           OrganizationMembership[]
+  refreshTokens         RefreshToken[]
+  tenant                Tenant?
+  identityVerifications IdentityVerification[]
 
   @@map("users")
 }
 
-// Opaque refresh token record. We never store the raw token, only a hash of
-// it, so a leaked database dump cannot be used to forge sessions. Storing
-// tokens (rather than trusting the JWT alone) is what makes revocation and
-// "logout everywhere" possible.
+// Opaque refresh token record - one row per issued refresh token, i.e. one
+// row per active login session/device. We never store the raw token, only
+// a SHA-256 hash of it, so a leaked database dump cannot be used to forge
+// sessions. Storing tokens (rather than trusting the JWT alone) is what
+// makes revocation and "logout everywhere" possible.
+//
+// Rotation: each refresh call revokes the presented row (revokedAt set) and
+// creates a brand new row for the replacement token - a row is never
+// updated back to "unrevoked". Presenting an already-revoked token is
+// treated as reuse (see AuthService.refresh); there is no explicit "session
+// family" column, so reuse detection revokes every other still-active row
+// for the same userId, which is a simpler, equally effective grouping given
+// Phase 1 has no other concept a family could hang off.
 model RefreshToken {
-  id        String    @id @default(uuid())
-  userId    String
-  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  tokenHash String    @unique
-  expiresAt DateTime
-  revokedAt DateTime?
-  createdAt DateTime  @default(now())
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  // Set once, when the row is created from a rotation. Distinct from
+  // `createdAt` only in intent (last time this exact token was *presented
+  // and accepted*, useful for "this device was active on ..." UI later).
+  lastUsedAt DateTime?
+  userAgent  String?
+  ipAddress  String?
+  createdAt  DateTime  @default(now())
 
   @@index([userId])
   @@map("refresh_tokens")
+}
+
+// Identity/KYC verification is deliberately its own domain, separate from
+// both authentication (proving access to an account) and residency (proving
+// someone actually lives somewhere). Authenticating does not imply verified
+// identity; being verified does not imply being a tenant anywhere.
+//
+// `provider`/`providerReference` are the seam for a future external KYC
+// vendor integration (DigiLocker, an Aadhaar-eKYC provider, etc.) - this
+// table stores the *result* of verification, never raw government ID
+// numbers or document images. If document storage is ever needed, it
+// belongs in encrypted object storage referenced by `providerReference`,
+// not as a column here.
+//
+// One user can hold multiple rows (one per verificationType, and a new row
+// each time a check is retried/re-verified) - never a single mutable
+// "verified: boolean" on User, which could not represent "verified for ID
+// but not yet for address" or preserve history of a failed then later
+// successful attempt.
+model IdentityVerification {
+  id                String                      @id @default(uuid())
+  userId            String
+  user              User                        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  verificationType  IdentityVerificationType
+  provider          String?
+  status            IdentityVerificationStatus  @default(NOT_STARTED)
+  providerReference String?
+  verifiedAt        DateTime?
+  expiresAt         DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([userId, verificationType])
+  @@map("identity_verifications")
 }
 
 // ---------------------------------------------------------------------------
