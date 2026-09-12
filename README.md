@@ -90,6 +90,16 @@ allocation service that relies on it (check-in/checkout/transfer) is
 built in Phase 4 - the schema comment documents the requirement now so it
 isn't forgotten later.
 
+## Running locally - learning notes
+
+If you're setting this up for the first time (or teaching yourself the
+"why" behind each step instead of just copy-pasting commands), see
+[LEARNING.md](LEARNING.md). It walks through an actual first-run session
+end to end: the prompts used, the issues hit along the way (a missing
+Docker install, a UAC elevation snag, Postgres rejecting a `pg_`-prefixed
+role name), the root cause of each, and a no-AI checklist to redo the
+whole flow yourself.
+
 ## Common commands
 
 | Command | Purpose |

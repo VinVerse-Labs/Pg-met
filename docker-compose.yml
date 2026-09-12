@@ -4,15 +4,15 @@ services:
     container_name: pg-backend-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: pg_backend
-      POSTGRES_PASSWORD: pg_backend
+      POSTGRES_USER: pgbackend
+      POSTGRES_PASSWORD: pgbackend
       POSTGRES_DB: pg_backend
     ports:
       - '5432:5432'
     volumes:
       - pg_backend_data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U pg_backend -d pg_backend']
+      test: ['CMD-SHELL', 'pg_isready -U pgbackend -d pg_backend']
       interval: 5s
       timeout: 5s
       retries: 10
