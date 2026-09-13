@@ -14,6 +14,9 @@ import { HealthModule } from './health/health.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { UsersModule } from './modules/users/users.module';
 import { IdentityVerificationModule } from './modules/identity-verification/identity-verification.module';
+import { MembershipsModule } from './modules/memberships/memberships.module';
+import { OrganizationsModule } from './modules/organizations/organizations.module';
+import { PropertiesModule } from './modules/properties/properties.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { RequestIdMiddleware } from './common/middleware/request-id.middleware';
@@ -42,6 +45,9 @@ import { HttpStatus } from '@nestjs/common';
     UsersModule,
     AuthModule,
     IdentityVerificationModule,
+    MembershipsModule,
+    OrganizationsModule,
+    PropertiesModule,
   ],
   providers: [
     {

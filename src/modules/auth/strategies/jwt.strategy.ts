@@ -1,18 +1,24 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
-import { UserStatus } from '@prisma/client';
+import { PlatformRole, UserStatus } from '@prisma/client';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { JwtConfig } from '../../../config/configuration';
 import { UsersService } from '../../users/users.service';
 import { AccessTokenPayload } from '../services/token.service';
 
+// The internal, request-attached shape of "who is making this call" - not
+// to be confused with UserResponseDto (the public /auth/me shape), which
+// deliberately omits platformRole. platformRole is included here because
+// Phase 2 authorization (SUPER_ADMIN bypass) needs it on every request;
+// exposing it publicly is a separate decision this type does not make.
 export interface AuthenticatedUser {
   id: string;
   name: string;
   email: string | null;
   phone: string | null;
   status: UserStatus;
+  platformRole: PlatformRole;
 }
 
 // Runs on every request protected by JwtAuthGuard. Deliberately re-reads the
@@ -46,6 +52,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       email: user.email,
       phone: user.phone,
       status: user.status,
+      platformRole: user.platformRole,
     };
   }
 }

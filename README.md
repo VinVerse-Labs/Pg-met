@@ -7,18 +7,23 @@ This repository is backend-only. The mobile apps (owner/manager and
 student) are separate React Native / Expo projects and are not part of
 this codebase.
 
-## Status: Phase 1 - Platform Identity, Authentication & KYC Foundation
+## Status: Phase 2 - Organizations, Properties & Multi-Tenant Authorization
 
 Phase 0 delivered the foundation: project setup, configuration, database
 connectivity, the core multi-tenant data model, global error handling,
 health checks and tooling.
 
-Phase 1 (this repository, current) adds platform user identity, JWT
-authentication with refresh-token rotation, multi-device sessions, and the
-identity-verification (KYC) domain foundation. It intentionally does
-**not** yet include organization/property-level authorization, PG
-applications, residency/check-in, rent, payments, complaints, food, or
-notifications - those come in later phases (see "Roadmap" below).
+Phase 1 added platform user identity, JWT authentication with
+refresh-token rotation, multi-device sessions, and the
+identity-verification (KYC) domain foundation.
+
+Phase 2 (this repository, current) adds organizations, organization
+memberships, PG properties, and the multi-tenant authorization layer that
+enforces "a user can only touch data in an organization they actively
+belong to." It intentionally does **not** yet include rooms, beds,
+tenants, residency, rent, payments, complaints, food, notifications, PG
+applications, or visit booking - those come in later phases (see
+"Roadmap" below).
 
 ## Tech stack
 
@@ -152,14 +157,17 @@ src/
 └── modules/
     ├── users/               # UsersService - the only code that reads/writes the `users` table
     ├── auth/                # Login/register/refresh/logout, JWT strategy/guard, token + password services
-    └── identity-verification/  # KYC domain foundation (no HTTP endpoints yet - see below)
+    ├── identity-verification/  # KYC domain foundation (no HTTP endpoints yet)
+    ├── memberships/          # MembershipsService - the single authorization chokepoint (Phase 2)
+    ├── organizations/        # Organization CRUD, OrganizationMembershipGuard, MembershipRoleGuard
+    └── properties/           # Property CRUD, scoped entirely through MembershipsService
 ```
 
-`organizations, properties, rooms, beds, tenants, rent, payments,
-complaints, food, announcements, notifications, subscriptions` do not
-exist as modules yet - they are added incrementally, one module per phase.
-Creating empty module shells ahead of the code that belongs in them would
-just be structure for its own sake.
+`rooms, beds, tenants, rent, payments, complaints, food, announcements,
+notifications, subscriptions` do not exist as modules yet - they are
+added incrementally, one module per phase. Creating empty module shells
+ahead of the code that belongs in them would just be structure for its
+own sake.
 
 ### Key decisions and why
 
@@ -172,6 +180,12 @@ just be structure for its own sake.
   recorded, scoped to one `Organization`. This is what lets one person be
   `OWNER` of one PG business and `STAFF` in another, and is the seam every
   future authorization guard hangs off.
+- **One authorization chokepoint (`MembershipsService`), not scattered
+  role checks.** Every organization/property permission decision -
+  guards and services alike - calls `assertOrganizationAccess`/`assertRole`
+  on this one service. See "Phase 2: multi-tenant authorization
+  architecture" below for the full request flow and why cross-tenant
+  access always returns 404, never 403.
 - **Bed allocation is an append-only history, not a `currentBedId`
   pointer.** `BedAllocation` rows are never overwritten; ending a stay
   sets `endDate`/`status`, it never deletes the row. The "two tenants, one
@@ -217,12 +231,13 @@ just be structure for its own sake.
   enough real nullability (optional email, nullable `endDate`, ...) that
   loose null checking would hide real bugs.
 
-## Data model (Phase 0 + Phase 1)
+## Data model (Phase 0 + Phase 1 + Phase 2)
 
 ```
-Organization
+Organization (status: ACTIVE | INACTIVE | SUSPENDED)
 ├── OrganizationMembership (user + role: OWNER | MANAGER | STAFF | STUDENT)
-└── Property
+│                          (status: ACTIVE | SUSPENDED | REMOVED)
+└── Property (status: ACTIVE | INACTIVE | ARCHIVED; propertyType: PG | HOSTEL | ...)
     └── Room
         └── Bed
             └── BedAllocation (history: tenant + bed + start/end + status)
@@ -234,8 +249,8 @@ User ──< IdentityVerification    (Phase 1: KYC foundation)
 ```
 
 - `User` is pure identity (phone/email/name/password hash). It has no
-  role field and no property/room/bed field - see "Key decisions" above
-  and "Phase 1: authentication & identity architecture" below.
+  role field and no organization/property/room/bed field - see "Key
+  decisions" above and the Phase 1/Phase 2 architecture sections below.
 - `Tenant` is intentionally separate from `User`: an owner can check a
   tenant in before that person ever creates a login.
 - `RefreshToken.tokenHash` is a SHA-256 hash - the raw refresh token is
@@ -243,6 +258,21 @@ User ──< IdentityVerification    (Phase 1: KYC foundation)
   detection, and multi-device sessions (see below).
 - `IdentityVerification` is its own table, deliberately never a boolean on
   `User`/`Tenant` - see "KYC / identity verification foundation" below.
+- `Organization.status` (`ACTIVE | INACTIVE | SUSPENDED`) is a distinct
+  enum from `Property.status` (`ACTIVE | INACTIVE | ARCHIVED`) even though
+  the names overlap - organization suspension is a platform-level
+  moderation action affecting everything underneath it; property archival
+  is an owner's own lifecycle decision. Conflating them would make one
+  feature accidentally mean something different for the other.
+- `OrganizationMembership.status` is `ACTIVE | SUSPENDED | REMOVED` -
+  deliberately no `INVITED` yet, since Phase 2 does not implement the
+  invitation flow (see "Membership invitation - deferred" below).
+  `@@unique([userId, organizationId])` is enforced by Postgres, not just
+  application code, so two concurrent "create organization" calls for the
+  same user can never race into duplicate membership rows.
+- `Property.propertyType` (`PG | HOSTEL | CO_LIVING | STUDENT_HOUSING`) is
+  provider-neutral on purpose - "PG" is the UI's word for this, not the
+  domain's. `Property` itself is never renamed or table-mapped to "PG".
 - `BedAllocation.status` is `ACTIVE | ENDED | CANCELLED`. Concurrency
   safety for "one bed, one active occupant" is enforced by a partial
   unique index (see "A note on the bed allocation constraint" above), not
@@ -251,38 +281,51 @@ User ──< IdentityVerification    (Phase 1: KYC foundation)
   constraint violation) is mapped to the standard error envelope
   automatically by `AllExceptionsFilter` - a future module doesn't need
   its own try/catch for that (this is what Phase 1's duplicate
-  email/phone handling relies on).
+  email/phone handling, and Phase 2's duplicate-membership constraint,
+  both rely on).
 
 ## Roles
 
 Five roles are modeled from day one: `SUPER_ADMIN` (platform-level, on
 `User.platformRole`), and `OWNER | MANAGER | STAFF | STUDENT`
-(organization-scoped, on `OrganizationMembership.role`). No authorization
-guards exist yet - that lands in Phase 1/2 as a small number of
-centralized guards, not scattered `if (role === ...)` checks in
-controllers.
+(organization-scoped, on `OrganizationMembership.role`). As of Phase 2,
+`OWNER`/`MANAGER`/`STAFF` are enforced by `MembershipsService` +
+`MembershipRoleGuard`/`PropertiesService` (see below); `STUDENT` is not
+granted through any Phase 2 endpoint - it exists in the enum for a future
+residency-driven flow, never assigned automatically just because someone
+stays at a PG.
 
 ## Testing strategy
 
 - `src/**/*.spec.ts` - unit tests, run with `npm test`. Covers
-  `AllExceptionsFilter` (Phase 0's highest-leverage error-handling logic),
-  and, as of Phase 1: `AuthService` (login/register/refresh
+  `AllExceptionsFilter` (Phase 0's highest-leverage error-handling logic);
+  from Phase 1: `AuthService` (login/register/refresh
   rotation/reuse-detection/logout, all edge cases from the spec),
   `TokenService` (payload minimality, secret isolation between access and
   refresh tokens, hash determinism), `IdentityVerificationService` (every
   valid and invalid state transition), and the email/phone normalization
-  helpers.
+  helpers; from Phase 2: `MembershipsService` (every branch of
+  `assertOrganizationAccess`/`assertRole`, including the SUPER_ADMIN
+  bypass and organization suspension), `OrganizationsService` (atomic
+  create, membership-scoped listing), and `PropertiesService` (the full
+  BOLA/IDOR-safe lookup, and the OWNER/MANAGER/STAFF permission matrix).
 - `test/*.e2e-spec.ts` - HTTP-level tests, run with `npm run test:e2e`.
   `PrismaService` is overridden with an in-memory fake in every e2e test
   so the suite does not require a running database; `auth.e2e-spec.ts`
   exercises the full register → login → `/me` → refresh-rotation →
-  reuse-detection → logout flow through real HTTP, guards, and the global
-  response envelope.
-- Authorization and cross-organization isolation tests are deliberately
-  **not** written yet - `OrganizationMembership`-based authorization
-  doesn't exist until Phase 2, and a test for code that doesn't exist is a
-  test for nothing. Called out explicitly here so it isn't forgotten once
-  that code lands.
+  reuse-detection → logout flow, and
+  `phase2-organizations-properties.e2e-spec.ts` exercises organization
+  creation, property creation/read/update/archive, and - the most
+  important cases - an "outsider" account being rejected (404) on every
+  one of an org's resources: reading the organization, reading its
+  property, creating a property in it via a spoofed `organizationId`,
+  patching its property, and archiving its property.
+- Duplicate-membership enforcement (`@@unique([userId, organizationId])`)
+  is verified at the database/migration level (confirmed during manual
+  verification) rather than through an HTTP test, because Phase 2 has no
+  invite/join endpoint that could ever attempt to create a second
+  membership row for the same user+organization - a test exercising an
+  endpoint that doesn't exist would test nothing real.
 
 ## Environment variables
 
@@ -417,18 +460,225 @@ attach to it instead of retrofitting KYC state onto `User` or `Tenant`.
 
 `SUPER_ADMIN` (platform-level, `User.platformRole`) is the only role
 meaningful without an organization. `OWNER`/`MANAGER`/`STAFF`/`STUDENT` are
-**not** columns on `User` - they will only ever be recorded on
-`OrganizationMembership.role` (Phase 2), scoped to one organization. Two
-different users can hold different roles in the same organization, and
-the same user can hold different roles in different organizations. Auth
+**not** columns on `User` - they are recorded on
+`OrganizationMembership.role`, scoped to one organization. Two different
+users can hold different roles in the same organization, and the same
+user can hold different roles in different organizations. Auth
 (`AuthService`/`JwtAuthGuard`) only ever answers "who is this user" -
-"what can this user do" is entirely Phase 2's concern.
+"what can this user do" is what Phase 2 (below) answers.
+
+## Phase 2: multi-tenant authorization architecture
+
+### User → OrganizationMembership → Organization → Property
+
+```
+User
+  │
+  ▼
+OrganizationMembership (role: OWNER | MANAGER | STAFF, per organization)
+  │
+  ▼
+Organization
+  │
+  ▼
+Property ("PG" in the UI - see "Why not call the table PG" below)
+```
+
+A `User` never belongs to an organization directly - the membership row is
+the only thing that grants access, and it can be revoked (`status:
+REMOVED`) without touching the `User` row at all. The same `User` can hold
+an `OrganizationMembership` in any number of organizations, with a
+different role in each:
+
+```
+Rahul (User u1)
+  ├── OrganizationMembership → "ABC Living"  → role: OWNER
+  └── OrganizationMembership → "XYZ Co-living" → role: MANAGER
+```
+
+This is the same principle Phase 1 established for residency, one level
+up: a `User` is never permanently tied to one `Organization`, exactly as a
+`User` is never permanently tied to one PG. The future PG-application /
+residency chain (Phase 4+) hangs off `User` and `Property` independently:
+
+```
+User
+  │
+  ▼
+Future PGApplication  ("has this person applied to stay here?")
+  │
+  ▼
+Future Residency      ("is this person currently staying here?")
+  │
+  ▼
+Property
+```
+
+`OrganizationMembership` (staff/ownership) and the future `Residency`
+(a student physically living somewhere) are unrelated axes - an `OWNER`
+does not thereby become a resident, and a resident does not thereby
+become an `OrganizationMembership` row. Conflating them was exactly the
+Phase 1 mistake this architecture avoids twice over.
+
+### Owner onboarding
+
+```
+Authenticated User
+  │
+  ▼
+POST /organizations  { name }
+  │
+  ▼  (single DB transaction)
+  ├── Organization created
+  └── OrganizationMembership created (role: OWNER, status: ACTIVE)
+```
+
+There is no other way to become an `OWNER` of a *new* organization, and no
+input field lets a client request `SUPER_ADMIN` or attach themselves as
+`OWNER` of an *existing* organization - `CreateOrganizationDto` has
+exactly one field (`name`). Becoming `OWNER` of someone else's existing
+organization, or `MANAGER`/`STAFF` of any organization, requires a future
+invitation flow (deferred - see below); Phase 2 has no endpoint that
+grants a membership in an organization the caller didn't just create.
+
+The transaction matters: if the membership insert ever failed after the
+organization insert succeeded, the whole call rolls back rather than
+leaving an organization with no owner (verified in
+`organizations.service.spec.ts`).
+
+### The request flow every organization/property endpoint follows
+
+```
+Request
+  │
+  ▼
+JwtAuthGuard          - who is making this request? (Phase 1)
+  │
+  ▼
+MembershipsService     - does this user have ANY access to this organization?
+  .assertOrganizationAccess()   (404 if not - existence hidden either way)
+  │
+  ▼
+MembershipsService     - does their role allow THIS action?
+  .assertRole()                 (403 if member but wrong role)
+  │
+  ▼
+Prisma query, scoped by organizationId IN <caller's accessible orgs>
+  │
+  ▼
+Response DTO (never a raw Prisma row)
+```
+
+Both guards and services call into the *same* `MembershipsService`
+methods - there is exactly one implementation of "is this access allowed,"
+never a guard's version and a service's version that could quietly drift
+apart.
+
+### Why cross-tenant access is 404, not 403
+
+An organization/property outside the caller's access returns
+`ORGANIZATION_NOT_FOUND` / `PROPERTY_NOT_FOUND` (404) whether it doesn't
+exist at all, or exists but belongs to someone else - the two are
+indistinguishable by design. If it instead returned 403 ("exists, but you
+can't see it"), a caller could enumerate real organization/property ids by
+noticing which ones 403 instead of 404. A `403 INSUFFICIENT_ROLE` is only
+ever returned *after* membership is already established (e.g. a `STAFF`
+member hitting an `OWNER`-only action) - at that point the caller already
+knows the resource exists, so there is nothing left to leak.
+
+### BOLA/IDOR protection: the query is scoped, never "load then check"
+
+`PropertiesService`'s core lookup is one query:
+
+```ts
+prisma.property.findFirst({
+  where: { id: propertyId, organizationId: { in: accessibleOrgIds } },
+});
+```
+
+not:
+
+```ts
+// NEVER this - "load by id, then check ownership after" leaks a timing
+// side channel and is one refactor away from someone deleting the check.
+const property = await prisma.property.findFirst({ where: { id: propertyId } });
+if (property.organizationId !== callerOrgId) throw new ForbiddenException();
+```
+
+`findOne`/`update`/`archive` all route through this one scoped lookup
+(`findAccessiblePropertyRow`), so there is exactly one place in the
+codebase that can get tenant isolation wrong, and it is covered by tests
+that specifically construct a "property belongs to another organization"
+scenario (`properties.service.spec.ts`, and end to end in
+`phase2-organizations-properties.e2e-spec.ts`).
+
+### Role rules (Phase 2)
+
+| Action | OWNER | MANAGER | STAFF |
+|---|---|---|---|
+| View organization | ✓ | ✓ | ✓ |
+| Update organization | ✓ | ✗ | ✗ |
+| Create property | ✓ | ✓ | ✗ |
+| View property | ✓ | ✓ | ✓ |
+| Update property | ✓ | ✓ | ✗ |
+| Archive ("delete") property | ✓ | ✗ | ✗ |
+
+`MANAGER` can create/update properties (routine day-to-day operational
+work an owner delegates) but cannot archive one or update the
+organization itself - archiving affects every resident/staff member under
+a property, and organization-level changes affect the whole business, both
+a materially bigger blast radius than editing a property's address.
+`SUPER_ADMIN` bypasses every one of these checks (platform-level access),
+but is still blocked by organization suspension exactly like anyone else.
+
+### Property lifecycle: archive, never hard-delete
+
+`DELETE /properties/:id` sets `status: ARCHIVED` - it never issues a SQL
+`DELETE`. A real property accumulates rooms, beds, tenants, and payment
+history in later phases; destroying the parent row would destroy all of
+that irrecoverably. An archived property is still readable
+(`GET /properties/:id` still returns it) - "archived" means "no longer an
+active listing," not "gone."
+
+### Why the table isn't called `PG`
+
+The model and table are `Property`/`properties`. "PG" is the product's
+word for what this row represents today, but the same shape needs to
+support hostels, co-living spaces, and student housing without a rename -
+`Property.propertyType` (`PG | HOSTEL | CO_LIVING | STUDENT_HOUSING`) is
+the extensible axis; the table name stays neutral forever.
+
+### Membership invitation - deferred
+
+Section 17 of the Phase 2 spec anticipates an eventual
+Owner-invites-Manager flow (`OrganizationMembership.status: INVITED` →
+accept → `ACTIVE`). It is deliberately **not** built in Phase 2: there is
+no invitation endpoint, no invitation token, and no `INVITED` status in
+the schema - adding a status Phase 2 never sets would be complexity
+without purpose. When this lands (see "What Phase 3 needs" - not covered
+in this document, see the Phase 2 implementation report), invitations
+must use a signed, single-use, expiring token - never a guessable
+sequential id - as their acceptance secret.
+
+### Privacy/security principles this phase adds
+
+- Client-supplied `organizationId` is data, never a credential -
+  authorization always comes from a fresh `MembershipsService` lookup for
+  the *authenticated* caller, never from trusting the field's presence.
+- No endpoint ever returns a raw Prisma row - `OrganizationResponseDto`/
+  `PropertyResponseDto` are built field-by-field, exactly like Phase 1's
+  `UserResponseDto`, so a future column never silently becomes public API
+  surface.
+- `Organization.status: SUSPENDED` blocks every member, and blocks
+  `SUPER_ADMIN` too - `SUPER_ADMIN` only bypasses the *membership*
+  requirement, not organization suspension. Suspension is a property of
+  the organization, not something any role can route around.
 
 ## Roadmap
 
-Phase 0 (done) → Phase 1 (this repository, done): platform identity, auth,
-sessions, KYC foundation → Phase 2: organizations + properties +
-authorization (`OrganizationMembership`-based) → Phase 3: rooms + beds →
+Phase 0 (done) → Phase 1 (done): platform identity, auth, sessions, KYC
+foundation → Phase 2 (this repository, done): organizations + properties +
+`OrganizationMembership`-based authorization → Phase 3: rooms + beds →
 Phase 4: tenants + bed allocation/residency → Phase 5: rent + invoices →
 Phase 6: payments → Phase 7: complaints → Phase 8: food/menu → Phase 9:
 notifications → Phase 10: subscriptions/billing.

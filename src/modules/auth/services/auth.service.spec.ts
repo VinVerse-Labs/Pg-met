@@ -85,7 +85,9 @@ describe('AuthService', () => {
       jti: 'jti-1',
       expiresAt: new Date(Date.now() + 1000 * 60 * 60),
     });
-    tokenService.hashToken.mockImplementation((token: string) => `hash(${token})`);
+    tokenService.hashToken.mockImplementation(
+      (token: string) => `hash(${token})`,
+    );
   });
 
   describe('register', () => {
@@ -105,7 +107,11 @@ describe('AuthService', () => {
       prisma.refreshToken.create.mockResolvedValue({});
 
       const result = await authService.register(
-        { name: 'Rahul', email: 'rahul@example.com', password: 'password123' } as any,
+        {
+          name: 'Rahul',
+          email: 'rahul@example.com',
+          password: 'password123',
+        } as any,
         meta,
       );
 
@@ -123,7 +129,10 @@ describe('AuthService', () => {
       usersService.findByIdentifier.mockResolvedValue(null);
 
       await expect(
-        authService.login({ identifier: 'ghost@example.com', password: 'x' }, meta),
+        authService.login(
+          { identifier: 'ghost@example.com', password: 'x' },
+          meta,
+        ),
       ).rejects.toMatchObject({
         code: ErrorCode.INVALID_CREDENTIALS,
         status: HttpStatus.UNAUTHORIZED,
@@ -135,7 +144,10 @@ describe('AuthService', () => {
       passwordService.verify.mockResolvedValue(false);
 
       await expect(
-        authService.login({ identifier: 'rahul@example.com', password: 'wrong' }, meta),
+        authService.login(
+          { identifier: 'rahul@example.com', password: 'wrong' },
+          meta,
+        ),
       ).rejects.toMatchObject({ code: ErrorCode.INVALID_CREDENTIALS });
     });
 
@@ -146,7 +158,10 @@ describe('AuthService', () => {
       passwordService.verify.mockResolvedValue(true);
 
       await expect(
-        authService.login({ identifier: 'rahul@example.com', password: 'password123' }, meta),
+        authService.login(
+          { identifier: 'rahul@example.com', password: 'password123' },
+          meta,
+        ),
       ).rejects.toMatchObject({
         code: ErrorCode.ACCOUNT_SUSPENDED,
         status: HttpStatus.FORBIDDEN,
@@ -160,7 +175,10 @@ describe('AuthService', () => {
       passwordService.verify.mockResolvedValue(true);
 
       await expect(
-        authService.login({ identifier: 'rahul@example.com', password: 'password123' }, meta),
+        authService.login(
+          { identifier: 'rahul@example.com', password: 'password123' },
+          meta,
+        ),
       ).rejects.toMatchObject({ code: ErrorCode.ACCOUNT_INACTIVE });
     });
 
@@ -233,7 +251,9 @@ describe('AuthService', () => {
       ).rejects.toMatchObject({ code: ErrorCode.TOKEN_REVOKED });
 
       expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { userId: 'user-1', revokedAt: null } }),
+        expect.objectContaining({
+          where: { userId: 'user-1', revokedAt: null },
+        }),
       );
     });
 
@@ -314,13 +334,16 @@ describe('AuthService', () => {
     passwordService.verify.mockResolvedValue(false);
 
     try {
-      await authService.login({ identifier: 'rahul@example.com', password: 'x' }, meta);
+      await authService.login(
+        { identifier: 'rahul@example.com', password: 'x' },
+        meta,
+      );
       fail('expected login to throw');
     } catch (error) {
       expect(error).toBeInstanceOf(AppException);
-      expect(JSON.stringify((error as AppException).details ?? '')).not.toContain(
-        'hashed-password',
-      );
+      expect(
+        JSON.stringify((error as AppException).details ?? ''),
+      ).not.toContain('hashed-password');
     }
   });
 });

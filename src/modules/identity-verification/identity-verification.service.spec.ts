@@ -91,9 +91,14 @@ describe('IdentityVerificationService', () => {
         status: from,
         verifiedAt: null,
       });
-      prisma.identityVerification.update.mockResolvedValue({ id: 'iv-1', status: to });
+      prisma.identityVerification.update.mockResolvedValue({
+        id: 'iv-1',
+        status: to,
+      });
 
-      await expect(service.transition('iv-1', to as any)).resolves.toBeDefined();
+      await expect(
+        service.transition('iv-1', to as any),
+      ).resolves.toBeDefined();
     });
 
     it.each([
@@ -108,9 +113,9 @@ describe('IdentityVerificationService', () => {
         verifiedAt: null,
       });
 
-      await expect(
-        service.transition('iv-1', to as any),
-      ).rejects.toMatchObject({ code: ErrorCode.INVALID_STATE_TRANSITION });
+      await expect(service.transition('iv-1', to as any)).rejects.toMatchObject(
+        { code: ErrorCode.INVALID_STATE_TRANSITION },
+      );
       expect(prisma.identityVerification.update).not.toHaveBeenCalled();
     });
 

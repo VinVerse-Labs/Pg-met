@@ -26,8 +26,17 @@ export enum ErrorCode {
   // Identity verification / KYC (Phase 1 foundation)
   INVALID_STATE_TRANSITION = 'INVALID_STATE_TRANSITION',
 
-  // Tenancy / authorization (foundation for Phase 2)
+  // Tenancy / authorization (Phase 2)
+  ORGANIZATION_NOT_FOUND = 'ORGANIZATION_NOT_FOUND',
   ORGANIZATION_ACCESS_DENIED = 'ORGANIZATION_ACCESS_DENIED',
+  ORGANIZATION_SUSPENDED = 'ORGANIZATION_SUSPENDED',
+  PROPERTY_NOT_FOUND = 'PROPERTY_NOT_FOUND',
+  PROPERTY_ACCESS_DENIED = 'PROPERTY_ACCESS_DENIED',
+  INSUFFICIENT_ROLE = 'INSUFFICIENT_ROLE',
+  DUPLICATE_MEMBERSHIP = 'DUPLICATE_MEMBERSHIP',
+  // Reserved for the future membership-management/invitation endpoints
+  // (see MembershipsService docs) - unused by any Phase 2 endpoint today.
+  MEMBERSHIP_NOT_FOUND = 'MEMBERSHIP_NOT_FOUND',
 
   // Bed allocation (foundation for Phase 4)
   BED_ALREADY_OCCUPIED = 'BED_ALREADY_OCCUPIED',

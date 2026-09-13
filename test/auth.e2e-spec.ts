@@ -21,14 +21,12 @@ class FakePrisma {
       if (where.id) return this.users.get(where.id) ?? null;
       if (where.email) {
         return (
-          [...this.users.values()].find((u) => u.email === where.email) ??
-          null
+          [...this.users.values()].find((u) => u.email === where.email) ?? null
         );
       }
       if (where.phone) {
         return (
-          [...this.users.values()].find((u) => u.phone === where.phone) ??
-          null
+          [...this.users.values()].find((u) => u.phone === where.phone) ?? null
         );
       }
       return null;
@@ -133,7 +131,11 @@ describe('Auth (e2e)', () => {
   it('registers a new user and returns tokens + a safe user profile', async () => {
     const response = await request(server())
       .post('/api/v1/auth/register')
-      .send({ name: 'Rahul', email: 'rahul@example.com', password: 'password123' })
+      .send({
+        name: 'Rahul',
+        email: 'rahul@example.com',
+        password: 'password123',
+      })
       .expect(201);
 
     expect(response.body.data.user).toEqual(
@@ -152,7 +154,11 @@ describe('Auth (e2e)', () => {
 
     const response = await request(server())
       .post('/api/v1/auth/register')
-      .send({ name: 'Dup Again', email: 'dup@example.com', password: 'password123' })
+      .send({
+        name: 'Dup Again',
+        email: 'dup@example.com',
+        password: 'password123',
+      })
       .expect(409);
 
     expect(response.body.error.code).toBe('CONFLICT');

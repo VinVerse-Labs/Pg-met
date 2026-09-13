@@ -32,9 +32,37 @@ enum MembershipRole {
   STUDENT
 }
 
+// No INVITED here on purpose: Phase 2 does not implement the invitation
+// flow (see MembershipsService docs) - a status this phase never sets is
+// complexity with no purpose yet. REMOVED is distinct from a hard delete:
+// the membership row (and its audit trail - who was a member, when) is
+// kept, it just no longer grants access.
 enum MembershipStatus {
   ACTIVE
+  SUSPENDED
+  REMOVED
+}
+
+// Deliberately separate from PropertyStatus even though the values
+// currently overlap - an Organization being SUSPENDED is a platform-level
+// moderation action (affects every property/member underneath it); a
+// Property being ARCHIVED is an owner's own lifecycle decision. Conflating
+// them would make a future "suspend this organization" feature accidentally
+// also mean something different for properties.
+enum OrganizationStatus {
+  ACTIVE
   INACTIVE
+  SUSPENDED
+}
+
+// Extensible on purpose - "PG" is the UI's word for this, not the domain's.
+// The table/enum stay provider-neutral so hostels/co-living/student housing
+// are new enum values later, never a schema migration or a parallel model.
+enum PropertyType {
+  PG
+  HOSTEL
+  CO_LIVING
+  STUDENT_HOUSING
 }
 
 // Extensible on purpose - identity/KYC is not Aadhaar-specific. New checks
@@ -59,9 +87,13 @@ enum IdentityVerificationStatus {
   REVOKED
 }
 
+// ARCHIVED is the soft-delete state: a property's DELETE endpoint archives
+// rather than destroys the row, because a real PG accumulates rooms, beds,
+// tenants and payment history underneath it that must never disappear.
 enum PropertyStatus {
   ACTIVE
   INACTIVE
+  ARCHIVED
 }
 
 enum RoomStatus {
@@ -193,9 +225,9 @@ model IdentityVerification {
 // The billable SaaS tenant. Owns one or more Properties. All business data
 // (properties, rooms, beds, tenants, ...) is scoped to an Organization.
 model Organization {
-  id     String         @id @default(uuid())
+  id     String             @id @default(uuid())
   name   String
-  status PropertyStatus @default(ACTIVE)
+  status OrganizationStatus @default(ACTIVE)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -222,7 +254,15 @@ model OrganizationMembership {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // A user has exactly one membership (one role) per organization.
+  // A user has exactly one membership (one role) per organization - the
+  // database enforces this, not just an application-level pre-check, so
+  // two concurrent "create organization"/"join organization" requests for
+  // the same user+org can never race into duplicate rows.
+  //
+  // No separate @@index([userId]): a composite index on (userId,
+  // organizationId) already serves "find all memberships for this user"
+  // queries via its leftmost column, so a second index would just be
+  // redundant write overhead for no read benefit.
   @@unique([userId, organizationId])
   @@index([organizationId])
   @@map("organization_memberships")
@@ -237,6 +277,7 @@ model Property {
   organizationId String
   organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   name           String
+  propertyType   PropertyType   @default(PG)
   addressLine1   String
   addressLine2   String?
   city           String
@@ -250,6 +291,9 @@ model Property {
   rooms Room[]
 
   @@index([organizationId])
+  // Every tenant-scoped "list my properties" / "is this property archived"
+  // query filters by both columns together - see PropertiesService.
+  @@index([organizationId, status])
   @@map("properties")
 }
 
