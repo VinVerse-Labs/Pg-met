@@ -7,7 +7,7 @@ This repository is backend-only. The mobile apps (owner/manager and
 student) are separate React Native / Expo projects and are not part of
 this codebase.
 
-## Status: Phase 6 - Tenant Payments, Platform Fee & Owner Settlement
+## Status: Phase 7 - Owner SaaS Subscription
 
 Phase 0 delivered the foundation: project setup, configuration, database
 connectivity, the core multi-tenant data model, global error handling,
@@ -36,19 +36,29 @@ rent, with full history when it changes) and `Invoice`/`InvoiceItem` (an
 immutable-once-issued snapshot of what a resident owes for one billing
 period, including mid-period proration).
 
-Phase 6 (this repository, current) adds the money-movement layer on top
-of that: a tenant can actually pay an invoice through Razorpay, the
-platform retains a small fee, and the remainder is tracked as a separate
-owner settlement. `Payment` (an attempt/transaction against one invoice),
-`PaymentAllocation` (how much of a payment counts toward an invoice's
-paid balance), `PlatformFeeRule`, `OwnerPaymentAccount`,
-`OwnerSettlement`, `Refund`, and `WebhookEvent` are all new this phase.
-**Payments are the tenant's rent flow; the owner's own SaaS subscription
-to this platform is a completely separate, not-yet-built domain.** Phase
-6 intentionally does **not** include owner SaaS subscription billing
-(plans, recharge, renewal, grace period, suspension - that's Phase 7),
-PG applications, visit booking, complaints, food, notifications, the
-student marketplace, or roommate matching (see "Roadmap" below).
+Phase 6 added the money-movement layer on top of that: a tenant can
+actually pay an invoice through Razorpay, the platform retains a small
+fee, and the remainder is tracked as a separate owner settlement.
+`Payment`, `PaymentAllocation`, `PlatformFeeRule`, `OwnerPaymentAccount`,
+`OwnerSettlement`, `Refund`, and `WebhookEvent` all belong to that
+tenant-rent flow.
+
+Phase 7 (this repository, current) adds the platform's *other* money
+flow: the PG owner paying **this platform** a monthly SaaS subscription,
+completely separate from Phase 6's tenant-rent payments (see "Two
+separate money flows" in "Phase 7" below - no model, service, or
+endpoint is shared between them). New this phase: `SaasPlan`,
+`OrganizationSubscription` (one per organization; `TRIAL -> ACTIVE ->
+RENEWAL_DUE -> GRACE_PERIOD -> SUSPENDED`, or `CANCELLED`),
+`SubscriptionInvoice` (a monthly, system-generated, price-snapshotted
+bill), and `SubscriptionPayment` (a Razorpay payment against one such
+invoice - no platform fee, no owner settlement, since the owner is
+paying the platform directly). Phase 7 intentionally does **not**
+include automatic recurring Razorpay subscriptions, SaaS refunds,
+coupons/promotions, a tax/GST engine, platform-admin plan management, PG
+applications, visit booking, complaints, food, notifications, the
+student marketplace, or roommate matching (see "Known limitations" in
+"Phase 7" below and "Roadmap").
 
 ## Tech stack
 
@@ -192,14 +202,17 @@ src/
     ├── residencies/          # Residency CRUD + check-in/check-out (BedAllocation lifecycle)
     ├── rent-plans/           # RentPlan CRUD, scoped through ResidenciesService.getAccessibleResidencyOrThrow
     ├── invoices/             # Invoice generation/lifecycle - the only Invoice/InvoiceItem creation path
-    └── payments/             # Tenant payment orders/verification/webhook, platform fee, owner settlement
-        └── gateway/            # PaymentGateway interface + RazorpayGatewayService (Razorpay is isolated here)
+    ├── payments/             # Tenant payment orders/verification/webhook, platform fee, owner settlement
+    │   └── gateway/            # PaymentGateway interface + RazorpayGatewayService (shared by Phase 6 and 7)
+    ├── saas-plans/           # SaasPlan lookup - deliberately no admin create/update/delete endpoint yet
+    ├── subscriptions/        # OrganizationSubscription lifecycle state machine + access policy
+    ├── subscription-invoices/  # SubscriptionInvoice generation/lookup - system-generated, never owner-authored
+    └── subscription-payments/  # SubscriptionPayment orders/verification - the owner paying the platform
 ```
 
-`complaints, food, announcements, notifications, subscriptions` (the
-owner's own SaaS subscription, not tenant rent payments) do not exist as
-modules yet - they are added incrementally, one module per phase.
-Creating empty module shells ahead of the code that belongs in them would
+`complaints, food, announcements, notifications` do not exist as modules
+yet - they are added incrementally, one module per phase. Creating empty
+module shells ahead of the code that belongs in them would
 just be structure for its own sake.
 
 ### Key decisions and why
@@ -233,7 +246,12 @@ just be structure for its own sake.
   `InvoicesService`'s own lookup, because that lookup is scoped only to
   organization membership - a tenant paying their own rent is not an
   organization member at all. See "Phase 6" below for the new,
-  narrower-scoped authorization path this required.
+  narrower-scoped authorization path this required. **Phase 7 returns to
+  the normal pattern**: `SubscriptionInvoicesService`/
+  `SubscriptionPaymentsService` reuse `MembershipsService
+  .assertOrganizationAccess`/`assertRole` directly (OWNER-only for every
+  subscription-billing endpoint), the same chokepoint every phase but 6
+  uses - see "Phase 7" below.
 - **Money is never a JS number.** Every monetary column is
   `Decimal @db.Decimal(12, 2)`, every calculation uses `Prisma.Decimal`
   arithmetic, and every API response serializes amounts as decimal
@@ -296,7 +314,7 @@ just be structure for its own sake.
   enough real nullability (optional email, nullable `endDate`, ...) that
   loose null checking would hide real bugs.
 
-## Data model (Phase 0 through Phase 6)
+## Data model (Phase 0 through Phase 7)
 
 ```
 Organization (status: ACTIVE | INACTIVE | SUSPENDED)
@@ -304,6 +322,11 @@ Organization (status: ACTIVE | INACTIVE | SUSPENDED)
 │                          (status: ACTIVE | SUSPENDED | REMOVED)
 ├── OwnerPaymentAccount (one per organization; provider account/onboarding status)
 ├── Payment[] / OwnerSettlement[] (denormalized organizationId - see below)
+├── OrganizationSubscription (1:1 - status: TRIAL | ACTIVE | RENEWAL_DUE |
+│                             GRACE_PERIOD | SUSPENDED | CANCELLED)
+│   └── SubscriptionInvoice (billing period, subtotal/tax/total, invoiceNumber;
+│                            status: DRAFT | ISSUED | OVERDUE | PAID | VOID)
+│       └── SubscriptionPayment[] (no platform fee, no owner settlement - see "Phase 7")
 └── Property (status: ACTIVE | INACTIVE | ARCHIVED; propertyType: PG | HOSTEL | ...)
     ├── Room (roomNumber, floor, roomType, capacity; status: ACTIVE | INACTIVE | ARCHIVED)
     │   └── Bed (bedNumber; status: AVAILABLE | INACTIVE | ARCHIVED)
@@ -320,7 +343,8 @@ Organization (status: ACTIVE | INACTIVE | SUSPENDED)
                 └── Refund[] (against a CAPTURED payment)
 
 PlatformFeeRule (global, not per-organization - see "Phase 6" below)
-WebhookEvent (provider + eventId, globally unique - Razorpay delivery log)
+WebhookEvent (provider + eventId, globally unique - shared by Phase 6 and 7)
+SaasPlan (global catalog - see "Phase 7" below)
 
 User ──< OrganizationMembership >── Organization
 User ──(1:1)── Tenant ──< Residency
@@ -453,6 +477,37 @@ User ──< IdentityVerification    (Phase 1: KYC foundation)
 - `PlatformFeeRule` has no `organizationId` at all - it's a single global,
   versioned business rule (`isActive`), not a per-organization setting -
   see "Phase 6" below.
+- `OrganizationSubscription.organizationId` is `@unique` - one
+  subscription per organization, mirroring `OwnerPaymentAccount`'s own
+  one-per-organization shape, never per-property (spec: "the SaaS
+  subscription belongs to the Organization"). It carries no `propertyId`
+  at all, which is what keeps a future per-property pricing model an
+  additive schema change rather than a redesign.
+- `OrganizationSubscription.pendingSaasPlanId` is Phase 7's plan-change
+  mechanism - set immediately by an owner action, applied to `saasPlanId`
+  (and cleared) only when the next `SubscriptionInvoice` is generated,
+  never retroactively. `SaasPlan.price` changing later never touches a
+  `SubscriptionInvoice`'s own `subtotal`/`total` - the same
+  snapshot-at-generation-time principle as `Invoice`/`RentPlan` (Phase 5).
+- `SubscriptionInvoice` and `SubscriptionPayment` are deliberately
+  separate models from Phase 5's `Invoice`/`Invoice Item` and Phase 6's
+  `Payment` - never reused, even though the shapes rhyme (spec: "do NOT
+  reuse Phase 6 Payment for SaaS payments"). `SubscriptionPayment` has no
+  `platformFee`/`ownerSettlementAmount` columns at all - there is no third
+  party to split funds with when the organization pays the platform
+  directly.
+- `@@unique([subscriptionId, billingPeriodStart, billingPeriodEnd], map:
+  "subscription_invoices_period_unique")` is Phase 7's one-invoice-per-
+  billing-period guarantee, the same plain-constraint pattern as Phase
+  5's `invoices_residency_billing_period_unique` - and explicitly given a
+  `map` (not just a Prisma-level `name`) this time, since `name` alone
+  never renames the actual Postgres constraint (see "Phase 7" below for
+  the real bug this distinction caught).
+- `WebhookEvent` is shared, unmodified, by both Phase 6 and Phase 7 - a
+  single `(provider, eventId)` idempotency table, because Razorpay itself
+  delivers both tenant-rent and SaaS-subscription events to the same
+  merchant account's one webhook URL. See "Phase 7" below for how
+  `PaymentsWebhookService` tells the two domains apart.
 
 ## Roles
 
@@ -615,6 +670,52 @@ stays at a PG.
   Both call sites now match on the column-name array as well as the
   declared constraint name (see `PaymentsWebhookService`/`InvoicesService`
   `isUniqueViolation`).
+- From Phase 7: `subscription-period.util.spec.ts` (calendar-aware
+  rolling monthly periods, including the exact spec example - Sep 20 to
+  Oct 19 - chaining correctly into the next period, and clamping a
+  month-end period start like Jan 30/31 without producing an invalid
+  date), `saas-plans.service.spec.ts` (active-only filtering, the default
+  plan being the oldest active one), `subscription-invoices.service
+  .spec.ts` (price snapshotting at generation time, concurrency-safe
+  invoice numbering, OWNER-only access, BOLA-safe lookup),
+  `subscriptions.service.spec.ts` (the full lifecycle state machine -
+  TRIAL/ACTIVE staying put within their period, the ACTIVE ->
+  RENEWAL_DUE transition and invoice generation exactly once, applying a
+  pending plan change at that same moment, RENEWAL_DUE -> GRACE_PERIOD,
+  GRACE_PERIOD -> SUSPENDED only after the grace period actually elapses,
+  cancel-at-period-end pre-empting a renewal instead of generating one,
+  and `activateFromPayment`'s period-extension/plan-application/state-
+  reset), and `subscription-payments.service.spec.ts` (server-calculated
+  amount from the invoice's own total, idempotency-key reuse, the
+  critical finalization transaction's PAID/ACTIVE outcome, its
+  idempotent short-circuit, and its already-PAID-invoice rejection
+  branch). `payments-webhook.service.spec.ts` gained cases proving
+  dispatch to the SaaS domain when no tenant-rent payment matches a
+  webhook's `providerOrderId`. `test/phase7-owner-saas-subscription
+  .e2e-spec.ts` exercises lazy TRIAL provisioning over HTTP, cancel-at-
+  period-end, the full order → verify → invoice-PAID → subscription-
+  ACTIVE flow (ageing a subscription's period directly in the e2e fake to
+  reach a real `SubscriptionInvoice`, since no HTTP endpoint fast-forwards
+  time by design), OWNER/MANAGER/STAFF authorization (403, not 404, for a
+  real member with an insufficient role), plan-change scheduling, and
+  cross-organization BOLA rejection.
+- The four mandatory concurrency requirements (spec's "CONCURRENCY
+  REQUIREMENTS" section) were all proven against the **real** running
+  Postgres instance with a one-off script exercising
+  `SubscriptionPaymentsService`/`PaymentsWebhookService` directly
+  (bypassing the real Razorpay API, exactly as Phase 6's equivalent proof
+  did): (1) two concurrent `finalizeCapturedPayment` calls for two
+  different payments against the same invoice resolved to exactly one
+  `CAPTURED` and one `FAILED`, with the invoice `PAID` and the
+  subscription `ACTIVE` with its period extended exactly once - never
+  twice; (2) two concurrent identical `payment.captured` webhook
+  deliveries for the same event resolved to exactly one `WebhookEvent`
+  row and exactly one finalization; (3) two concurrent
+  `createOrder` calls with the same `idempotencyKey` resolved to exactly
+  one `SubscriptionPayment` row, both callers receiving the same payment
+  id; (4) two concurrent finalization attempts against an
+  already-`PAID` invoice resolved to zero `CAPTURED` payments - no
+  duplicate successful payment against an invalid invoice.
 
 ## Environment variables
 
@@ -1823,13 +1924,313 @@ respectively) - confirmed in `phase6-tenant-payments.e2e-spec.ts` for
 every payment action against an unrelated user and an unrelated
 organization.
 
-### Explicitly out of scope (Phase 7 and beyond)
+### Explicitly out of scope in Phase 6 (delivered in Phase 7)
 
-The owner's own SaaS subscription to this platform is Phase 7 - plans,
+The owner's own SaaS subscription to this platform was Phase 7 - plans,
 monthly recharge, subscription status, renewal, grace period, suspension,
-and owner subscription invoices. Nothing in Phase 6 records a
-subscription charge, and `Payment`/`Invoice` are never reused to
-represent one (see "Two separate money flows" above).
+and owner subscription invoices. Nothing in Phase 6 itself recorded a
+subscription charge, and `Payment`/`Invoice` were never reused to
+represent one (see "Two separate money flows" above, and "Phase 7"
+below for what actually landed).
+
+## Phase 7: owner SaaS subscription
+
+### Two separate money flows - Phase 7 only touches the second one
+
+```
+Flow A (Phase 6): Tenant → Payment → Platform Fee → Owner Settlement
+Flow B (this phase): PG Owner → SubscriptionPayment → Platform
+```
+
+Flow A is a tenant paying their PG rent; Flow B is the owner's own
+recurring bill for using this SaaS platform. They share no model, no
+service, and no endpoint - `SubscriptionPayment` is never used to
+represent a tenant's rent payment, and Phase 6's `Payment` is never used
+to represent a subscription charge. The two domains share exactly two
+things, deliberately: the `PaymentGateway` abstraction (both are Razorpay
+payments under the same merchant account) and the `WebhookEvent`
+idempotency table (both arrive at the same webhook URL) - see "Razorpay
+and webhook dispatch" below for how thin that shared surface actually is.
+
+### Organization → OrganizationSubscription → SubscriptionInvoice → SubscriptionPayment
+
+```
+Organization              ("one owner's PG business - may own many Properties")
+  │
+  ▼
+OrganizationSubscription  ("this organization's current SaaS plan and billing period")
+  │
+  ▼
+SubscriptionInvoice       ("a billed period: subtotal/tax/total, a price snapshot")
+  │
+  ▼
+SubscriptionPayment       ("this organization attempted/completed paying that invoice")
+```
+
+Deliberately organization-scoped, never per-property (spec: "one owner
+can have multiple PG properties under the same organization... the owner
+should pay one organization-level SaaS subscription") -
+`OrganizationSubscription` has no `propertyId` column at all, so
+per-property SaaS pricing is a schema addition later, never a redesign of
+this phase's work.
+
+### Subscription lifecycle
+
+```
+TRIAL ──trial ends──▶ ACTIVE ──period ends──▶ RENEWAL_DUE ──next read──▶ GRACE_PERIOD
+                         ▲                                                    │
+                         │                                          grace period expires
+                    successful                                                ▼
+                     payment ◀───────────────────────────────────────── SUSPENDED
+                         │
+              (also reachable from RENEWAL_DUE directly)
+
+ACTIVE / TRIAL ──cancel requested, then period ends──▶ CANCELLED (terminal)
+```
+
+- **`TRIAL`** - the state a subscription is lazily created in on an
+  organization's first billing-endpoint access (`SubscriptionsService
+  .getOrCreateForOrganization`) - there is no separate "start
+  subscription" endpoint, the same "created on first legitimate need"
+  pattern Phase 6 uses for nothing but which fits this domain naturally:
+  an organization exists before anyone has ever looked at its billing
+  page. `currentPeriodEnd` is `now + DEFAULT_TRIAL_DAYS` (configurable,
+  never hardcoded - see "Configuration" below). No `SubscriptionInvoice`
+  exists during an active trial - it's free.
+- **`ACTIVE`** - a paid, current period. Reached either from a fresh
+  trial's first payment or from `RENEWAL_DUE`/`GRACE_PERIOD`/`SUSPENDED`
+  via a successful payment (`SubscriptionPaymentsService
+  .finalizeCapturedPayment` → `SubscriptionsService.activateFromPayment`).
+- **`RENEWAL_DUE`** - set the moment `currentPeriodEnd` is reached and the
+  next `SubscriptionInvoice` is generated (system-generated, `ISSUED`
+  immediately, due immediately) - deliberately transient: the very next
+  lifecycle evaluation moves it straight to `GRACE_PERIOD`. There is no
+  separate "grace period start" action; this is what that transition
+  point looks like given the project's lazy-evaluation convention (see
+  below).
+- **`GRACE_PERIOD`** - `gracePeriodEndsAt = now + SUBSCRIPTION_GRACE_PERIOD_DAYS`
+  (configurable). The organization can still pay and return to `ACTIVE`
+  during this window.
+- **`SUSPENDED`** - set once `gracePeriodEndsAt` passes with no successful
+  payment. See "Suspension" below for what this does and does not block.
+- **`CANCELLED`** - terminal, reached only via the explicit cancel action,
+  and only once the already-paid current period actually ends (spec:
+  "cancel at period end", never immediate) - see "Cancellation" below.
+
+Every transition happens in `SubscriptionsService.evaluateLifecycle`,
+never through a client-supplied status field (spec: "do not allow
+arbitrary status changes through a generic PATCH endpoint") - the only
+client-facing mutations are the explicit `change-plan` and `cancel`
+actions, the same "action-based, not generic PATCH" principle every
+lifecycle in this codebase uses (Phase 4's check-in/check-out, Phase 5's
+issue/void).
+
+### Lazy evaluation, not a cron job - and the seam for one
+
+There is no scheduler infrastructure in this project (confirmed before
+building this, same as Phase 5's `OVERDUE` evaluation). Every lifecycle
+transition instead happens lazily, inside a locked transaction, on every
+read of a subscription (`GET .../subscription` and everywhere else
+`SubscriptionsService` touches a subscription row) -
+`evaluateLifecycle(subscriptionId)` is idempotent and safe to call
+repeatedly (spec requirement), and `SubscriptionsService
+.processDueSubscriptions()` is the batch seam a future `daily scheduled
+job` would call instead of relying on incidental reads - it queries every
+subscription whose `nextBillingAt`/`gracePeriodEndsAt` has passed and
+evaluates each one. Nothing currently calls it; it exists so that adding
+a scheduler later is wiring one cron trigger to one existing method, not
+designing the state machine from scratch.
+
+### Calendar-aware rolling billing periods
+
+```
+currentPeriodStart = 2026-09-20
+currentPeriodEnd   = 2026-10-19     (one month later, minus one day)
+next period        = 2026-10-20 → 2026-11-19
+```
+
+`subscription-period.util.ts`'s `addOneCalendarMonthUtc` uses the same
+`Date.UTC`-based clamping idiom as Phase 5's billing-period util (`Jan
+31 -> Feb 28/29`, never an invalid rolled-over date) - but unlike Phase
+5's calendar-month-aligned billing, a SaaS subscription's period rolls
+from whatever day it started, never realigned to the 1st of a month.
+
+### Invoice generation, numbering, and historical price integrity
+
+`SubscriptionInvoice` is system-generated only - there is no "create SaaS
+invoice" endpoint, since these are automated recurring bills, not
+owner-authored the way Phase 5's tenant rent invoices are.
+`subtotal`/`tax`/`total` snapshot `SaasPlan.price` at generation time and
+never change afterward, even if the plan's price changes later (spec:
+"existing invoices must still retain the historical amount") - the same
+principle as `Invoice` never re-reading `RentPlan` in Phase 5.
+`invoiceNumber` (`SAAS-<year>-<6-digit-sequence>`) comes from a dedicated
+Postgres sequence (`saas_invoice_number_seq`), never `COUNT(*) + 1` -
+identical reasoning and mechanism to Phase 5's `invoice_number_seq`. One
+invoice per subscription per billing period is enforced by
+`subscription_invoices_period_unique`, a plain (non-partial) unique
+constraint - see "A real bug, caught twice" below for why it is given an
+explicit `map`, not just a Prisma-level `name`.
+
+### Plan changes: scheduled, never retroactive
+
+`POST .../subscription/change-plan` sets `pendingSaasPlanId` immediately
+but changes nothing about the current period - the new plan is only
+applied (`saasPlanId = pendingSaasPlanId`, then cleared) at the moment
+the *next* `SubscriptionInvoice` is generated, inside
+`evaluateLifecycle`. This is Phase 7's deliberately simple proration
+rule (spec: "for Phase 7, avoid complex mid-cycle proration... plan
+change takes effect at the next billing period") - a paid-for period is
+never partially refunded or re-billed mid-cycle.
+
+### Cancellation: at period end, never immediate
+
+`POST .../subscription/cancel` sets `cancelledAt` and nothing else -
+access and billing continue exactly as before through the already-paid
+current period. Only when `evaluateLifecycle` next reaches
+`currentPeriodEnd` does it check `cancelledAt` and transition straight to
+`CANCELLED` instead of generating another invoice. No properties, rooms,
+beds, tenants, residencies, invoices, or payments are ever deleted by
+cancellation (spec: "do not delete subscription data") - cancellation is
+purely a future billing decision.
+
+### Payment: server-calculated amount, no platform fee, no owner settlement
+
+`POST /subscription/invoices/:invoiceId/payments/order` takes only an
+optional `idempotencyKey` in its body - there is no amount field
+anywhere in the request (spec: "never accept the subscription price from
+the client"). The amount is always `SubscriptionInvoice.total`, read
+server-side. `SubscriptionPayment` has no `platformFee`/
+`ownerSettlementAmount` columns at all, unlike Phase 6's `Payment` -
+there is no third party to split funds with when an organization pays
+the platform directly (spec: "there is no owner settlement in this
+flow").
+
+### The critical transaction
+
+`SubscriptionPaymentsService.finalizeCapturedPayment` implements the
+spec's own pseudocode exactly: lock the invoice row
+(`SELECT ... FOR UPDATE`), verify it is not already `PAID`/`VOID`, lock
+the subscription row, mark the payment `CAPTURED`, mark the invoice
+`PAID`, then call `SubscriptionsService.activateFromPayment` to extend
+the period to the invoice's own billing period, apply any pending plan
+change, set `nextBillingAt`, clear `gracePeriodEndsAt`, and set status
+`ACTIVE` - all inside one transaction. Called from either
+`POST /subscription/payments/:id/verify` (client-side path) or the
+`payment.captured` webhook (server-side path) - whichever arrives first
+finalizes; the method is idempotent (a payment already `CAPTURED` returns
+immediately), so the second arrival is always a safe no-op.
+
+### Razorpay and webhook dispatch: reused, not duplicated
+
+Phase 7 reuses Phase 6's `PaymentGateway` interface and
+`RazorpayGatewayService` completely unchanged - `PAYMENT_GATEWAY` was
+hoisted out of `PaymentsModule` into its own `PaymentGatewayModule`
+specifically so both `PaymentsModule` and the new
+`SubscriptionPaymentsModule` could depend on it without a circular
+module dependency between them (`SubscriptionPaymentsModule` never
+imports anything from `PaymentsModule`).
+
+The webhook side needed the same reuse: Razorpay delivers every event -
+tenant-rent and SaaS-subscription alike - to the same merchant account's
+one webhook URL, so `PaymentsWebhookController`/`PaymentsWebhookService`
+(Phase 6) remain the single entry point. `PaymentsWebhookService` now
+looks up a matching row in Phase 6's `Payment` table first and, if none
+matches, falls back to Phase 7's `SubscriptionPayment` table by the same
+`providerOrderId` before giving up and logging a safe no-op - this is the
+one place either domain's service is aware the other exists, and it's a
+pure dispatch decision, never shared business logic.
+`(provider, eventId)` idempotency is unmodified and applies uniformly to
+both domains' events, because it is fundamentally the same guarantee
+("this exact webhook delivery has already been processed") regardless of
+which internal table the payment belongs to.
+
+### Idempotency
+
+Same two-layer approach as Phase 6, applied to the new tables: webhook
+delivery idempotency via the shared `WebhookEvent(provider, eventId)`
+constraint, and order-creation idempotency via
+`SubscriptionPayment.idempotencyKey` (`@unique`) - a retried
+`createOrder` call with the same key returns the original payment's order
+info rather than creating a second one, with the unique constraint (not
+just the pre-check) as the actual guarantee under a genuine concurrent
+retry.
+
+### Authorization: OWNER-only, even to view
+
+Unlike every prior phase's Property/Room/Bed/Tenant/Residency/Invoice
+resources (OWNER **and** MANAGER can usually act, STAFF can usually
+view), Phase 7's spec is explicit that subscription billing is
+**OWNER-only for everything, including read access** -
+`SubscriptionsService`/`SubscriptionInvoicesService`/
+`SubscriptionPaymentsService` each call `MembershipsService
+.assertOrganizationAccess` + `assertRole(user, membership, ['OWNER'])`
+on every endpoint, the same chokepoint every phase but 6 uses. A
+MANAGER/STAFF member gets `403 INSUFFICIENT_ROLE` (a real member, just
+the wrong role - never hidden as a 404), while a non-member gets the
+usual `404 ORGANIZATION_NOT_FOUND` - confirmed in
+`phase7-owner-saas-subscription.e2e-spec.ts` for both cases.
+
+### Suspension: an access policy, deliberately not wired in yet
+
+`SubscriptionAccessGuard`/`SubscriptionsService.isAccessBlocked` are the
+reusable policy spec section "Suspension" asks for (never scattered
+`if (subscription.status === ...)` checks) - they check *membership*
+(any role, not OWNER-only, since suspension is meant to affect a
+MANAGER/STAFF's day-to-day work too) and answer "is this organization's
+subscription currently SUSPENDED."
+
+**This guard is not applied to any Phase 0-6 controller.** Wiring
+"blocked while suspended" into every existing properties/rooms/beds/
+tenants/residencies/rent-plans/invoices/payments route would mean
+touching every one of those stable, already-shipped modules - explicitly
+out of scope for a phase whose own instructions were "do not modify
+previous phases' behavior unnecessarily" and "no new rent/invoice
+functionality." Per the spec's own "final safety rule" ("if
+implementation reveals an architectural ambiguity that materially
+affects financial correctness, STOP and report the ambiguity rather than
+making a risky assumption"), this is flagged here and in the final report
+as a deliberate, visible gap rather than a silent guess in either
+direction - the guard exists and is unit-tested, ready to be applied
+wherever a future decision says it should be.
+
+### A real bug, caught twice
+
+Phase 6 already discovered that Prisma's `P2002` error `target` for a
+plain schema-declared `@@unique` reports column names, not the
+constraint's given `name:`, against real Postgres. Writing Phase 7's
+equivalent check for `subscription_invoices_period_unique` surfaced the
+other half of that same lesson: `name:` on `@@unique` only affects
+Prisma's generated **Client** API, never the actual **database**
+constraint object - only `map:` does that. This constraint is declared
+with both, and its own conflict-detection code matches on both the name
+and the column set, the same defensive pattern Phase 6 established.
+
+### Known limitations
+
+- **No live Razorpay verification.** Exactly like Phase 6, this
+  environment has no live Razorpay test credentials - order creation,
+  signature verification math, and webhook signature math are all
+  code-level/unit-verified (`razorpay-gateway.service.spec.ts`, shared
+  with Phase 6), but an actual round trip through Razorpay's real API was
+  not performed. The database-level guarantees (idempotency, concurrency,
+  the critical transaction) were proven against the real Postgres
+  container directly, bypassing the gateway entirely.
+- **No automatic recurring Razorpay subscriptions.** Phase 7 implements
+  manual renewal via generated `SubscriptionInvoice`s that the owner pays
+  (spec's own stated first-implementation choice) - Razorpay's own
+  recurring-subscription product is not integrated.
+- **No SaaS refunds.** `SubscriptionRefund` was deliberately not built
+  (spec: "prefer deferring SaaS refunds if not explicitly required") -
+  `SubscriptionPaymentStatus` includes `REFUNDED` in the enum for future
+  use, but no code path sets it.
+- **No coupons/promotions, tax/GST engine, or platform-admin plan
+  management.** `SubscriptionInvoice.tax` is always `0`, stored and ready
+  for a future calculation; `SaasPlansService` has no create/update/
+  delete endpoint (a new plan is added by inserting a row directly, per
+  its own doc comment).
+- **`SubscriptionAccessGuard` is not wired into any Phase 0-6 route** -
+  see "Suspension" above.
 
 ## Roadmap
 
@@ -1837,7 +2238,7 @@ Phase 0 (done) → Phase 1 (done): platform identity, auth, sessions, KYC
 foundation → Phase 2 (done): organizations + properties +
 `OrganizationMembership`-based authorization → Phase 3 (done): rooms +
 beds → Phase 4 (done): tenants + residency + bed allocation → Phase 5
-(done): rent + invoices → Phase 6 (this repository, done): tenant
-payments + platform fee + owner settlement (Razorpay) → Phase 7: owner
+(done): rent + invoices → Phase 6 (done): tenant payments + platform fee
++ owner settlement (Razorpay) → Phase 7 (this repository, done): owner
 SaaS subscription (plans, recharge, renewal, grace period, suspension) →
 Phase 8: complaints → Phase 9: food/menu → Phase 10: notifications.

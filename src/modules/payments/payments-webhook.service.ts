@@ -8,6 +8,7 @@ import {
   PaymentGateway,
 } from './gateway/payment-gateway.interface';
 import { PaymentsService } from './payments.service';
+import { SubscriptionPaymentsService } from '../subscription-payments/subscription-payments.service';
 
 interface RazorpayWebhookPaymentEntity {
   id?: string;
@@ -36,6 +37,7 @@ export class PaymentsWebhookService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly paymentsService: PaymentsService,
+    private readonly subscriptionPaymentsService: SubscriptionPaymentsService,
     @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
   ) {}
 
@@ -109,19 +111,46 @@ export class PaymentsWebhookService {
       return;
     }
 
-    const payment = await this.prisma.payment.findUnique({
+    // Both tenant-rent payments (Phase 6) and SaaS subscription payments
+    // (Phase 7) are Razorpay orders/payments under the same merchant
+    // account, so there is exactly one webhook URL for both domains -
+    // this is the single dispatch point that tells them apart, purely by
+    // which table's `providerOrderId` matches. Neither domain's service
+    // knows about webhooks at all beyond its own `finalizeCapturedPayment`.
+    const tenantPayment = await this.prisma.payment.findUnique({
       where: { providerOrderId: paymentEntity.order_id },
     });
-    if (!payment) {
-      // A payment made outside our order-creation flow, or for a payment
-      // this instance never created - safe to acknowledge and ignore
-      // rather than fail the webhook delivery.
-      this.logger.warn(
-        `WEBHOOK_NO_MATCHING_PAYMENT order=${paymentEntity.order_id}`,
+    if (tenantPayment) {
+      await this.handleTenantPaymentEvent(body, paymentEntity, tenantPayment);
+      return;
+    }
+
+    const subscriptionPayment =
+      await this.subscriptionPaymentsService.findByProviderOrderId(
+        paymentEntity.order_id,
+      );
+    if (subscriptionPayment) {
+      await this.handleSubscriptionPaymentEvent(
+        body,
+        paymentEntity,
+        subscriptionPayment,
       );
       return;
     }
 
+    // A payment made outside our order-creation flow, or for a payment
+    // this instance never created - safe to acknowledge and ignore rather
+    // than fail the webhook delivery.
+    this.logger.warn(
+      `WEBHOOK_NO_MATCHING_PAYMENT order=${paymentEntity.order_id}`,
+    );
+  }
+
+  private async handleTenantPaymentEvent(
+    body: RazorpayWebhookPayload,
+    paymentEntity: RazorpayWebhookPaymentEntity,
+    payment: { id: string; status: string },
+  ): Promise<void> {
     if (body.event === 'payment.captured') {
       await this.paymentsService.finalizeCapturedPayment(
         payment.id,
@@ -134,6 +163,34 @@ export class PaymentsWebhookService {
     if (body.event === 'payment.failed') {
       if (payment.status === 'CREATED' || payment.status === 'PENDING') {
         await this.prisma.payment.update({
+          where: { id: payment.id },
+          data: {
+            status: 'FAILED',
+            providerPaymentId: paymentEntity.id,
+            failureCode: paymentEntity.error_code,
+            failureMessage: paymentEntity.error_description,
+          },
+        });
+      }
+    }
+  }
+
+  private async handleSubscriptionPaymentEvent(
+    body: RazorpayWebhookPayload,
+    paymentEntity: RazorpayWebhookPaymentEntity,
+    payment: { id: string; status: string },
+  ): Promise<void> {
+    if (body.event === 'payment.captured') {
+      await this.subscriptionPaymentsService.finalizeCapturedPayment(
+        payment.id,
+        paymentEntity.id!,
+      );
+      return;
+    }
+
+    if (body.event === 'payment.failed') {
+      if (payment.status === 'CREATED' || payment.status === 'PENDING') {
+        await this.prisma.subscriptionPayment.update({
           where: { id: payment.id },
           data: {
             status: 'FAILED',

@@ -7,7 +7,12 @@ import {
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
-import { appConfig, jwtConfig, razorpayConfig } from './config/configuration';
+import {
+  appConfig,
+  jwtConfig,
+  razorpayConfig,
+  subscriptionConfig,
+} from './config/configuration';
 import { envValidationSchema } from './config/env.validation';
 import { PrismaModule } from './database/prisma.module';
 import { HealthModule } from './health/health.module';
@@ -24,6 +29,10 @@ import { ResidenciesModule } from './modules/residencies/residencies.module';
 import { RentPlansModule } from './modules/rent-plans/rent-plans.module';
 import { InvoicesModule } from './modules/invoices/invoices.module';
 import { PaymentsModule } from './modules/payments/payments.module';
+import { SaasPlansModule } from './modules/saas-plans/saas-plans.module';
+import { SubscriptionsModule } from './modules/subscriptions/subscriptions.module';
+import { SubscriptionInvoicesModule } from './modules/subscription-invoices/subscription-invoices.module';
+import { SubscriptionPaymentsModule } from './modules/subscription-payments/subscription-payments.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { RequestIdMiddleware } from './common/middleware/request-id.middleware';
@@ -36,7 +45,7 @@ import { HttpStatus } from '@nestjs/common';
     ConfigModule.forRoot({
       isGlobal: true,
       validationSchema: envValidationSchema,
-      load: [appConfig, jwtConfig, razorpayConfig],
+      load: [appConfig, jwtConfig, razorpayConfig, subscriptionConfig],
     }),
     ThrottlerModule.forRoot([
       {
@@ -62,6 +71,10 @@ import { HttpStatus } from '@nestjs/common';
     RentPlansModule,
     InvoicesModule,
     PaymentsModule,
+    SaasPlansModule,
+    SubscriptionsModule,
+    SubscriptionInvoicesModule,
+    SubscriptionPaymentsModule,
   ],
   providers: [
     {

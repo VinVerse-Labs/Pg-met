@@ -2,6 +2,7 @@ import { Prisma } from '@prisma/client';
 import { PaymentGateway } from './gateway/payment-gateway.interface';
 import { PaymentsService } from './payments.service';
 import { PaymentsWebhookService } from './payments-webhook.service';
+import { SubscriptionPaymentsService } from '../subscription-payments/subscription-payments.service';
 import { ErrorCode } from '../../common/constants/error-code.enum';
 
 function p2002(target: string) {
@@ -32,14 +33,23 @@ describe('PaymentsWebhookService', () => {
   let service: PaymentsWebhookService;
   let prisma: any;
   let paymentsService: { finalizeCapturedPayment: jest.Mock };
+  let subscriptionPaymentsService: {
+    findByProviderOrderId: jest.Mock;
+    finalizeCapturedPayment: jest.Mock;
+  };
   let gateway: jest.Mocked<PaymentGateway>;
 
   beforeEach(() => {
     prisma = {
       webhookEvent: { create: jest.fn(), update: jest.fn() },
       payment: { findUnique: jest.fn(), update: jest.fn() },
+      subscriptionPayment: { update: jest.fn() },
     };
     paymentsService = { finalizeCapturedPayment: jest.fn() };
+    subscriptionPaymentsService = {
+      findByProviderOrderId: jest.fn().mockResolvedValue(null),
+      finalizeCapturedPayment: jest.fn(),
+    };
     gateway = {
       createOrder: jest.fn(),
       verifyPaymentSignature: jest.fn(),
@@ -51,6 +61,7 @@ describe('PaymentsWebhookService', () => {
     service = new PaymentsWebhookService(
       prisma,
       paymentsService as unknown as PaymentsService,
+      subscriptionPaymentsService as unknown as SubscriptionPaymentsService,
       gateway,
     );
   });
@@ -159,6 +170,68 @@ describe('PaymentsWebhookService', () => {
     );
 
     expect(paymentsService.finalizeCapturedPayment).not.toHaveBeenCalled();
+    expect(
+      subscriptionPaymentsService.finalizeCapturedPayment,
+    ).not.toHaveBeenCalled();
     expect(prisma.webhookEvent.update).toHaveBeenCalled();
+  });
+
+  it('dispatches to SubscriptionPaymentsService when no tenant payment matches but a subscription payment does', async () => {
+    gateway.verifyWebhookSignature.mockReturnValue(true);
+    prisma.webhookEvent.create.mockResolvedValue({ id: 'evt-4' });
+    prisma.payment.findUnique.mockResolvedValue(null);
+    subscriptionPaymentsService.findByProviderOrderId.mockResolvedValue({
+      id: 'sub-pay-1',
+      status: 'PENDING',
+    });
+
+    await service.processRazorpayWebhook(
+      Buffer.from('{}'),
+      'good-sig',
+      capturedPayload({ order_id: 'order_subscription_1' }),
+      'evt_4',
+    );
+
+    expect(
+      subscriptionPaymentsService.finalizeCapturedPayment,
+    ).toHaveBeenCalledWith('sub-pay-1', 'pay_xyz');
+    expect(paymentsService.finalizeCapturedPayment).not.toHaveBeenCalled();
+  });
+
+  it('marks a subscription payment FAILED on a verified payment.failed event', async () => {
+    gateway.verifyWebhookSignature.mockReturnValue(true);
+    prisma.webhookEvent.create.mockResolvedValue({ id: 'evt-5' });
+    prisma.payment.findUnique.mockResolvedValue(null);
+    subscriptionPaymentsService.findByProviderOrderId.mockResolvedValue({
+      id: 'sub-pay-2',
+      status: 'PENDING',
+    });
+
+    await service.processRazorpayWebhook(
+      Buffer.from('{}'),
+      'good-sig',
+      {
+        event: 'payment.failed',
+        payload: {
+          payment: {
+            entity: {
+              id: 'pay_xyz',
+              order_id: 'order_subscription_2',
+              error_code: 'BAD_REQUEST_ERROR',
+              error_description: 'Card declined',
+            },
+          },
+        },
+      },
+      'evt_5',
+    );
+
+    expect(prisma.subscriptionPayment.update).toHaveBeenCalledWith({
+      where: { id: 'sub-pay-2' },
+      data: expect.objectContaining({
+        status: 'FAILED',
+        failureCode: 'BAD_REQUEST_ERROR',
+      }),
+    });
   });
 });

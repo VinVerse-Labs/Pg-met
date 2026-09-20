@@ -22,6 +22,15 @@ export const razorpayConfig = registerAs('razorpay', () => ({
   webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET,
 }));
 
+export const subscriptionConfig = registerAs('subscription', () => ({
+  trialDays: parseInt(process.env.DEFAULT_TRIAL_DAYS ?? '30', 10),
+  gracePeriodDays: parseInt(
+    process.env.SUBSCRIPTION_GRACE_PERIOD_DAYS ?? '7',
+    10,
+  ),
+}));
+
 export type AppConfig = ReturnType<typeof appConfig>;
 export type JwtConfig = ReturnType<typeof jwtConfig>;
 export type RazorpayConfig = ReturnType<typeof razorpayConfig>;
+export type SubscriptionConfig = ReturnType<typeof subscriptionConfig>;

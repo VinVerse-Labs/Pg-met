@@ -25,4 +25,10 @@ export const envValidationSchema = Joi.object({
   RAZORPAY_KEY_ID: Joi.string().required(),
   RAZORPAY_KEY_SECRET: Joi.string().required(),
   RAZORPAY_WEBHOOK_SECRET: Joi.string().required(),
+
+  // Owner SaaS subscription (Phase 7). Both are business rules that will
+  // change over time - never hardcoded as a literal `30`/`7` anywhere in
+  // application code (see SubscriptionsService).
+  DEFAULT_TRIAL_DAYS: Joi.number().integer().min(0).default(30),
+  SUBSCRIPTION_GRACE_PERIOD_DAYS: Joi.number().integer().min(0).default(7),
 });

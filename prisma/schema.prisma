@@ -286,6 +286,72 @@ enum RefundStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Owner SaaS subscription (Phase 7)
+//
+// A completely separate financial domain from Phase 6: the PG *owner*
+// pays *this platform* for the right to use it, as opposed to a *tenant*
+// paying an *owner* rent (Phase 6). No model here is ever reused for a
+// tenant rent payment, and no Phase 6 model is reused here - see
+// README's "Phase 7" section for the full "two separate money flows"
+// reasoning.
+// ---------------------------------------------------------------------------
+
+// ACTIVE plans are offered to organizations; INACTIVE plans are retired
+// (never deleted - existing subscriptions/invoices still reference them).
+enum SaasPlanStatus {
+  ACTIVE
+  INACTIVE
+}
+
+// Deliberately just MONTHLY for Phase 7 - see BillingCycle (Phase 5) for
+// the same "one value now, extensible enum" reasoning.
+enum SaasBillingInterval {
+  MONTHLY
+}
+
+// TRIAL -> ACTIVE -> RENEWAL_DUE -> GRACE_PERIOD -> SUSPENDED is the
+// normal unpaid-lapse path; a successful payment from RENEWAL_DUE,
+// GRACE_PERIOD, or SUSPENDED all return to ACTIVE. CANCELLED is reachable
+// only from ACTIVE/TRIAL (via the explicit cancel-at-period-end action)
+// and is terminal. All transitions are decided by
+// SubscriptionsService.evaluateLifecycle / explicit action methods, never
+// a client-supplied status field - see SubscriptionsService docs.
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  RENEWAL_DUE
+  GRACE_PERIOD
+  SUSPENDED
+  CANCELLED
+}
+
+// Mirrors Phase 5's InvoiceStatus shape deliberately (DRAFT/ISSUED/
+// OVERDUE/VOID) plus PAID, but is its own enum on its own model -
+// SubscriptionInvoice is never stored in the Invoice table, since an
+// owner's SaaS bill and a tenant's rent bill are different domains that
+// happen to share a similar lifecycle shape.
+enum SubscriptionInvoiceStatus {
+  DRAFT
+  ISSUED
+  OVERDUE
+  PAID
+  VOID
+}
+
+// Same shape as Phase 6's PaymentStatus, deliberately without
+// REFUNDED/PARTIALLY_REFUNDED distinctions beyond REFUNDED - SaaS refunds
+// are out of scope for Phase 7 (see SubscriptionPayment's doc comment).
+enum SubscriptionPaymentStatus {
+  CREATED
+  PENDING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+// ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
 
@@ -400,6 +466,10 @@ model Organization {
   payments    Payment[]
   settlements OwnerSettlement[]
   paymentAccount OwnerPaymentAccount?
+
+  subscription         OrganizationSubscription?
+  subscriptionInvoices SubscriptionInvoice[]
+  subscriptionPayments SubscriptionPayment[]
 
   @@map("organizations")
 }
@@ -1049,4 +1119,199 @@ model WebhookEvent {
 
   @@unique([provider, eventId], name: "webhook_events_provider_event_unique")
   @@map("webhook_events")
+}
+
+// ---------------------------------------------------------------------------
+// Owner SaaS subscription (Phase 7)
+//
+// Chain: Organization -> OrganizationSubscription -> SubscriptionInvoice ->
+// SubscriptionPayment. Deliberately organization-scoped, never per-property
+// (spec section: "one owner -> one organization-level subscription, unless
+// a future plan explicitly introduces property-based pricing") - an
+// OrganizationSubscription has no propertyId column at all, so per-property
+// billing is a schema addition later, not a redesign.
+//
+// Webhook processing (payment.captured) is dispatched from the same
+// PaymentsWebhookService/WebhookEvent table Phase 6 already built - see
+// PaymentsWebhookService for how it distinguishes a tenant-rent Payment
+// from a SubscriptionPayment by providerOrderId. There is exactly one
+// (provider, eventId) idempotency table for both domains, because Razorpay
+// itself only has one webhook delivery stream per merchant account.
+// ---------------------------------------------------------------------------
+
+// A billable tier the platform offers to organizations. Price changes
+// never mutate a plan row in place in a way that could alter historical
+// billing - see SubscriptionInvoice's doc comment for why a plan's
+// *current* price and a *historical invoice's* amount are deliberately
+// different values (the invoice snapshots it). `effectiveFrom`/
+// `effectiveTo` exist for the same reason RentPlan (Phase 5) has them -
+// if a plan's price genuinely changes, a new SaasPlan row is created and
+// the old one's `effectiveTo`/`status: INACTIVE` are set, rather than
+// editing `price` on the existing row.
+model SaasPlan {
+  id              String              @id @default(uuid())
+  name            String
+  description     String?
+  price           Decimal             @db.Decimal(12, 2)
+  currency        String              @default("INR")
+  billingInterval SaasBillingInterval @default(MONTHLY)
+  status          SaasPlanStatus      @default(ACTIVE)
+  effectiveFrom   DateTime            @default(now())
+  effectiveTo     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subscriptions OrganizationSubscription[]
+  pendingFor    OrganizationSubscription[] @relation("PendingPlan")
+  invoices      SubscriptionInvoice[]
+
+  @@index([status])
+  @@map("saas_plans")
+}
+
+// At most one subscription per organization (`@unique` on
+// `organizationId`) - the organization can change plans over time, but
+// always through this one row, never a second parallel subscription.
+//
+// `currentPeriodStart`/`currentPeriodEnd` describe the *last paid* (or
+// trial) period - they are only extended by
+// SubscriptionPaymentsService.finalizeCapturedPayment, never by invoice
+// generation itself (see SubscriptionInvoice - a generated invoice
+// describes a *prospective* next period that does not become "current"
+// until it is actually paid). `nextBillingAt` mirrors `currentPeriodEnd`
+// and exists as its own column so a future scheduled job
+// (`SubscriptionLifecycleService.processDueSubscriptions`) can index and
+// query on it directly without reasoning about period semantics.
+//
+// `pendingSaasPlanId` is Phase 7's plan-change mechanism (spec: "plan
+// change takes effect at the next billing period") - set immediately by
+// an owner's change-plan action, applied to `saasPlanId` (and cleared)
+// only when the *next* invoice is generated, never retroactively - this
+// is what keeps a plan change from ever altering an already-issued
+// invoice's snapshot amount.
+model OrganizationSubscription {
+  id             String       @id @default(uuid())
+  organizationId String       @unique
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  saasPlanId     String
+  saasPlan       SaasPlan     @relation(fields: [saasPlanId], references: [id], onDelete: Restrict)
+
+  pendingSaasPlanId String?
+  pendingSaasPlan   SaasPlan? @relation("PendingPlan", fields: [pendingSaasPlanId], references: [id], onDelete: SetNull)
+
+  status             SubscriptionStatus @default(TRIAL)
+  startedAt          DateTime           @default(now())
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  nextBillingAt      DateTime
+  gracePeriodEndsAt  DateTime?
+  cancelledAt        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoices SubscriptionInvoice[]
+  payments SubscriptionPayment[]
+
+  @@index([status])
+  @@index([nextBillingAt])
+  @@map("organization_subscriptions")
+}
+
+// A permanent financial record - "how much this organization owed for
+// this SaaS billing period" - snapshotted at generation time, exactly
+// like Phase 5's Invoice: `subtotal`/`tax`/`total` never change after
+// creation even if the referenced `SaasPlan.price` changes later.
+// `saasPlanId` is kept for traceability, the same non-authoritative role
+// `Invoice.rentPlanId` plays in Phase 5.
+//
+// `invoiceNumber` is generated from a dedicated Postgres sequence
+// (`saas_invoice_number_seq`), never `COUNT(*) + 1` - same reasoning as
+// Phase 5's `invoice_number_seq`.
+//
+// One invoice per subscription per billing period is enforced by a plain
+// (non-partial) unique constraint, the same pattern Phase 5 uses for
+// `invoices_residency_billing_period_unique`.
+model SubscriptionInvoice {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  subscriptionId String
+  subscription   OrganizationSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  saasPlanId     String
+  saasPlan       SaasPlan     @relation(fields: [saasPlanId], references: [id], onDelete: Restrict)
+
+  invoiceNumber      String                    @unique
+  billingPeriodStart DateTime
+  billingPeriodEnd   DateTime
+  subtotal           Decimal                   @db.Decimal(12, 2)
+  tax                Decimal                   @db.Decimal(12, 2) @default(0)
+  total              Decimal                   @db.Decimal(12, 2)
+  currency           String                    @default("INR")
+  status             SubscriptionInvoiceStatus @default(ISSUED)
+  issuedAt           DateTime?
+  dueAt              DateTime
+  paidAt             DateTime?
+  voidedAt           DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payments SubscriptionPayment[]
+
+  // `map` gives the actual Postgres constraint this friendly name (Prisma's
+  // `name:` alone only affects the generated Client API, not the database
+  // object - see the Phase 6 lesson in README's "Phase 6" section about
+  // P2002's `target` reporting column names rather than any given name
+  // regardless of this, which is why the catch-block below still also
+  // matches on column names, not just this string).
+  @@unique([subscriptionId, billingPeriodStart, billingPeriodEnd], name: "subscription_invoices_period_unique", map: "subscription_invoices_period_unique")
+  @@index([organizationId, status])
+  @@index([dueAt, status])
+  @@map("subscription_invoices")
+}
+
+// One payment attempt/transaction against exactly one SubscriptionInvoice
+// - deliberately has no platform-fee or owner-settlement fields
+// (unlike Phase 6's Payment): the organization is paying the platform
+// directly, there is no third party to split funds with. `amount` is
+// always `SubscriptionInvoice.total`, read from the database, never
+// client-supplied (spec: "never accept the subscription price from the
+// client").
+//
+// A single invoice may have multiple payment attempts (a failed one
+// followed by a successful retry) - never assume the first is the only
+// one; `finalizeCapturedPayment` is what actually marks the invoice PAID,
+// and does so at most once per invoice (see its own docs for the
+// concurrency guarantee).
+model SubscriptionPayment {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  subscriptionId String
+  subscription   OrganizationSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  subscriptionInvoiceId String
+  subscriptionInvoice   SubscriptionInvoice @relation(fields: [subscriptionInvoiceId], references: [id], onDelete: Cascade)
+
+  amount   Decimal                   @db.Decimal(12, 2)
+  currency String                    @default("INR")
+  provider PaymentProvider           @default(RAZORPAY)
+  status   SubscriptionPaymentStatus @default(CREATED)
+
+  providerOrderId   String? @unique
+  providerPaymentId String? @unique
+  idempotencyKey    String? @unique
+
+  failureCode    String?
+  failureMessage String?
+  capturedAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId])
+  @@index([subscriptionId])
+  @@index([subscriptionInvoiceId])
+  @@map("subscription_payments")
 }
