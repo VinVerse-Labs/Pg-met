@@ -107,6 +107,18 @@ export class PropertiesService {
     return PropertyResponseDto.fromEntity(property);
   }
 
+  // Public reuse seam for Phase 3 (RoomsService) and beyond: the exact same
+  // org-scoped, BOLA-safe lookup this service uses internally, exposed so
+  // a child resource's authorization chain (Room -> Property -> Organization)
+  // starts from the same verified Property row instead of re-deriving
+  // "is this property accessible" logic in a second place.
+  async getAccessiblePropertyOrThrow(
+    user: AuthenticatedUser,
+    propertyId: string,
+  ): Promise<Property> {
+    return this.findAccessiblePropertyRow(user, propertyId);
+  }
+
   async update(
     user: AuthenticatedUser,
     propertyId: string,

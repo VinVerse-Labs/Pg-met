@@ -17,4 +17,12 @@ export const envValidationSchema = Joi.object({
   JWT_REFRESH_EXPIRES_IN: Joi.string().default('7d'),
 
   CORS_ORIGINS: Joi.string().allow('').default(''),
+
+  // Razorpay (Phase 6). Not required outside of endpoints that actually
+  // call the gateway, but validated up front like every other secret in
+  // this project - a missing key should fail at startup, not on the first
+  // tenant's payment attempt.
+  RAZORPAY_KEY_ID: Joi.string().required(),
+  RAZORPAY_KEY_SECRET: Joi.string().required(),
+  RAZORPAY_WEBHOOK_SECRET: Joi.string().required(),
 });

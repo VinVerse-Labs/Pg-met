@@ -16,5 +16,12 @@ export const jwtConfig = registerAs('jwt', () => ({
   refreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN ?? '7d',
 }));
 
+export const razorpayConfig = registerAs('razorpay', () => ({
+  keyId: process.env.RAZORPAY_KEY_ID,
+  keySecret: process.env.RAZORPAY_KEY_SECRET,
+  webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET,
+}));
+
 export type AppConfig = ReturnType<typeof appConfig>;
 export type JwtConfig = ReturnType<typeof jwtConfig>;
+export type RazorpayConfig = ReturnType<typeof razorpayConfig>;

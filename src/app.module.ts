@@ -7,7 +7,7 @@ import {
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
-import { appConfig, jwtConfig } from './config/configuration';
+import { appConfig, jwtConfig, razorpayConfig } from './config/configuration';
 import { envValidationSchema } from './config/env.validation';
 import { PrismaModule } from './database/prisma.module';
 import { HealthModule } from './health/health.module';
@@ -17,6 +17,13 @@ import { IdentityVerificationModule } from './modules/identity-verification/iden
 import { MembershipsModule } from './modules/memberships/memberships.module';
 import { OrganizationsModule } from './modules/organizations/organizations.module';
 import { PropertiesModule } from './modules/properties/properties.module';
+import { RoomsModule } from './modules/rooms/rooms.module';
+import { BedsModule } from './modules/beds/beds.module';
+import { TenantsModule } from './modules/tenants/tenants.module';
+import { ResidenciesModule } from './modules/residencies/residencies.module';
+import { RentPlansModule } from './modules/rent-plans/rent-plans.module';
+import { InvoicesModule } from './modules/invoices/invoices.module';
+import { PaymentsModule } from './modules/payments/payments.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { RequestIdMiddleware } from './common/middleware/request-id.middleware';
@@ -29,7 +36,7 @@ import { HttpStatus } from '@nestjs/common';
     ConfigModule.forRoot({
       isGlobal: true,
       validationSchema: envValidationSchema,
-      load: [appConfig, jwtConfig],
+      load: [appConfig, jwtConfig, razorpayConfig],
     }),
     ThrottlerModule.forRoot([
       {
@@ -48,6 +55,13 @@ import { HttpStatus } from '@nestjs/common';
     MembershipsModule,
     OrganizationsModule,
     PropertiesModule,
+    RoomsModule,
+    BedsModule,
+    TenantsModule,
+    ResidenciesModule,
+    RentPlansModule,
+    InvoicesModule,
+    PaymentsModule,
   ],
   providers: [
     {

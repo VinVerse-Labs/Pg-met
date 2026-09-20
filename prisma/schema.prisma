@@ -96,31 +96,193 @@ enum PropertyStatus {
   ARCHIVED
 }
 
+// Kept deliberately small - SINGLE/DOUBLE/TRIPLE/FOUR describe occupancy by
+// bed count, DORMITORY is an open shared room, OTHER is the escape hatch
+// rather than growing this enum for every edge case a listing might need.
+enum RoomType {
+  SINGLE
+  DOUBLE
+  TRIPLE
+  FOUR
+  DORMITORY
+  OTHER
+}
+
+// ARCHIVED is the soft-delete state - see Room's DELETE endpoint. A room is
+// never hard-deleted once beds (and, from Phase 4, allocation history) can
+// reference it.
 enum RoomStatus {
   ACTIVE
   INACTIVE
+  ARCHIVED
 }
 
+// AVAILABLE is the ordinary "in service" state (occupied or not - Phase 3
+// has no allocation/tenant concept yet, so this enum says nothing about
+// whether someone is currently in the bed). INACTIVE is a reversible
+// operational pause (e.g. temporarily out of use); ARCHIVED is the
+// soft-delete state set by the DELETE endpoint and is not reversed by this
+// phase's API.
 enum BedStatus {
-  ACTIVE
+  AVAILABLE
   INACTIVE
-  MAINTENANCE
+  ARCHIVED
 }
 
-enum TenantStatus {
+// PENDING is the state a Residency is created in - a tenant has been
+// scheduled to move into a property, but check-in (which assigns a bed via
+// BedAllocation) hasn't happened yet. This is deliberately a separate step
+// from check-in (see ResidenciesService/spec section 19): creating a
+// residency and allocating a bed are two different decisions with two
+// different atomicity boundaries, not one combined operation.
+//
+// NOTICE_PERIOD has no endpoint that sets it in Phase 4 - kept in the enum
+// now (rather than added later) because it's part of the intended lifecycle
+// shape and a future "give notice" action only needs a new endpoint, not a
+// schema change or a migration. Same pattern as MembershipStatus.REMOVED in
+// Phase 2, which also predates the endpoint that will eventually set it.
+//
+// Valid transitions (enforced in ResidenciesService, not by a DB CHECK
+// constraint - see IdentityVerification for why application-level
+// transition rules are preferred here): PENDING -> ACTIVE (check-in only),
+// ACTIVE -> CHECKED_OUT and NOTICE_PERIOD -> CHECKED_OUT (check-out only).
+// Nothing else is valid: a PENDING residency cannot check out without
+// checking in first, and a CHECKED_OUT residency is terminal.
+enum ResidencyStatus {
+  PENDING
   ACTIVE
-  INACTIVE
+  NOTICE_PERIOD
   CHECKED_OUT
 }
 
 // ACTIVE = currently occupying the bed. Every other status is historical.
 // Exactly one ACTIVE allocation may exist per bed, and exactly one ACTIVE
-// allocation may exist per tenant - enforced by partial unique indexes
-// added in a follow-up migration (see migration.sql comments).
+// residency may exist per tenant - enforced by partial unique indexes
+// added by hand in the migration SQL (see BedAllocation/Residency docs).
 enum BedAllocationStatus {
   ACTIVE
   ENDED
   CANCELLED
+}
+
+// Kept to exactly one value on purpose - Phase 5 has no weekly/yearly
+// billing requirement, and an enum (rather than a free-text string) is
+// what makes adding WEEKLY/YEARLY later a new value, not a data migration.
+enum BillingCycle {
+  MONTHLY
+}
+
+// Deliberately just two values, not a generic free-form status - the only
+// controlled transition is ACTIVE -> INACTIVE (RentPlansService.deactivate,
+// or implicitly when a new plan supersedes it), never a client-supplied
+// arbitrary string. See RentPlan's doc comment for why amount changes
+// create a new row instead of mutating this one.
+enum RentPlanStatus {
+  ACTIVE
+  INACTIVE
+}
+
+// DRAFT is created by generation and is still editable; ISSUED is a
+// financial snapshot (spec section 17 - immutable except through VOID);
+// OVERDUE is a lazily-derived state (see InvoicesService.evaluateStatus) -
+// there is no cron/job infrastructure in this project yet, so nothing
+// proactively sweeps for overdue invoices; a read of an ISSUED invoice
+// past its dueDate transitions it opportunistically. PARTIALLY_PAID/PAID
+// are set by PaymentsService (Phase 6) once a successful PaymentAllocation
+// brings the sum of successful allocations to, respectively, less than or
+// equal to (but greater than zero) the invoice total. VOID is terminal and
+// is never overwritten by a payment - a voided invoice cannot be paid.
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  OVERDUE
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+// Only RENT exists in Phase 5. Kept as an enum (not a free string) so
+// SECURITY_DEPOSIT/FOOD/UTILITY/LATE_FEE/DISCOUNT/OTHER are new values
+// later, never a schema change - but none of those billing features are
+// implemented this phase, so only RENT is defined.
+enum InvoiceItemType {
+  RENT
+}
+
+// ---------------------------------------------------------------------------
+// Tenant payments & platform settlement (Phase 6)
+// ---------------------------------------------------------------------------
+
+// Only one gateway is integrated in Phase 6. Kept as an enum (not a bare
+// string) so a second provider is a new value later, never a schema
+// change - same pattern as BillingCycle/InvoiceItemType.
+enum PaymentProvider {
+  RAZORPAY
+}
+
+// Mirrors Razorpay's own order/payment lifecycle rather than inventing a
+// parallel one: CREATED (internal Payment row + gateway order created,
+// nothing captured yet) -> PENDING/AUTHORIZED (gateway-reported
+// intermediate states) -> CAPTURED (money received - the only state that
+// ever creates a PaymentAllocation) -> FAILED/CANCELLED (terminal, no
+// money moved) -> REFUNDED/PARTIALLY_REFUNDED (money returned after a
+// prior CAPTURED). Transitions are enforced in PaymentsService, never by
+// a client-supplied status field - see spec section 13.
+enum PaymentStatus {
+  CREATED
+  PENDING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+// Deliberately just FIXED for Phase 6 (spec section 19/20 - "do not build
+// a complex fee engine unless necessary"). PERCENTAGE is a documented
+// future value, not implemented by PlatformFeeService yet - adding it
+// later is a new enum value, never a schema migration.
+enum PlatformFeeType {
+  FIXED
+}
+
+// PENDING - settlement recorded but not yet transferred to the owner's
+// account; PROCESSING - transfer requested from the gateway; SETTLED -
+// gateway confirmed the transfer; FAILED - the gateway could not
+// complete it (tenant payment is NOT affected - see OwnerSettlement doc
+// comment); REVERSED - a refund on the underlying payment required
+// reversing a settlement that had already reached PROCESSING/SETTLED.
+enum SettlementStatus {
+  PENDING
+  PROCESSING
+  SETTLED
+  FAILED
+  REVERSED
+}
+
+// Mirrors the Razorpay Route "linked account" onboarding lifecycle -
+// PENDING until the owner completes the gateway's own KYC/onboarding,
+// ACTIVE once transfers can be created against it, SUSPENDED if the
+// gateway disables it later.
+enum OwnerPaymentAccountStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+}
+
+// A webhook provider is deliberately its own enum (distinct from
+// PaymentProvider) even though Phase 6 only ever writes RAZORPAY here -
+// a future non-payment webhook source (e.g. a KYC vendor) would use the
+// same WebhookEvent table with a different value, not a parallel table.
+enum WebhookProvider {
+  RAZORPAY
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSED
+  FAILED
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +308,7 @@ model User {
   refreshTokens         RefreshToken[]
   tenant                Tenant?
   identityVerifications IdentityVerification[]
+  payments              Payment[]
 
   @@map("users")
 }
@@ -234,7 +397,9 @@ model Organization {
 
   memberships OrganizationMembership[]
   properties  Property[]
-  tenants     Tenant[]
+  payments    Payment[]
+  settlements OwnerSettlement[]
+  paymentAccount OwnerPaymentAccount?
 
   @@map("organizations")
 }
@@ -288,7 +453,9 @@ model Property {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  rooms Room[]
+  rooms       Room[]
+  residencies Residency[]
+  payments    Payment[]
 
   @@index([organizationId])
   // Every tenant-scoped "list my properties" / "is this property archived"
@@ -297,12 +464,26 @@ model Property {
   @@map("properties")
 }
 
+// roomNumber is a string, not an int - real-world numbering ("G01",
+// "A-101", "DORM-1") is never purely numeric, and treating it as one would
+// force awkward client-side formatting for something that is really just a
+// label. Only unique per property (see @@unique below), never globally -
+// "Room 101" existing in two different properties is normal, not a
+// collision.
 model Room {
   id         String     @id @default(uuid())
   propertyId String
   property   Property   @relation(fields: [propertyId], references: [id], onDelete: Cascade)
-  name       String
+  roomNumber String
   floor      Int?
+  roomType   RoomType
+  // Maximum number of beds this room may hold - enforced in
+  // RoomsService/BedsService via a locked read-count-then-write
+  // transaction (SELECT ... FOR UPDATE on this row), not by a CHECK
+  // constraint - Postgres cannot express "count of a *different* table's
+  // rows" in a column constraint. See RoomsService docs for the exact
+  // concurrency strategy.
+  capacity   Int
   status     RoomStatus @default(ACTIVE)
 
   createdAt DateTime @default(now())
@@ -310,88 +491,562 @@ model Room {
 
   beds Bed[]
 
-  // Room names/numbers only need to be unique within a property.
-  @@unique([propertyId, name])
+  @@unique([propertyId, roomNumber])
   @@index([propertyId])
+  @@index([propertyId, status])
   @@map("rooms")
 }
 
+// bedNumber is a string for the same reason as Room.roomNumber ("B1", "1",
+// "BED-A" are all valid) and is unique only per room, never globally.
 model Bed {
-  id     String    @id @default(uuid())
-  roomId String
-  room   Room      @relation(fields: [roomId], references: [id], onDelete: Cascade)
-  label  String
-  status BedStatus @default(ACTIVE)
+  id        String    @id @default(uuid())
+  roomId    String
+  room      Room      @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  bedNumber String
+  status    BedStatus @default(AVAILABLE)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   allocations BedAllocation[]
 
-  @@unique([roomId, label])
+  @@unique([roomId, bedNumber])
   @@index([roomId])
+  @@index([roomId, status])
   @@map("beds")
 }
 
 // ---------------------------------------------------------------------------
-// Tenants & bed allocation history
+// Tenants, residency & bed allocation (Phase 4)
+//
+// Phase 0 originally scaffolded Tenant as an organization-scoped guest
+// record (name/phone/email/status, optional userId) and BedAllocation as a
+// direct Tenant<->Bed link. Phase 4 replaces that shape - both tables were
+// still empty (never built on by any service through Phase 3) - with the
+// architecture the product actually needs: a tenant is a thin, global,
+// 1:1 domain profile on top of User (never a duplicate identity), and
+// occupancy is tracked as history through an explicit Residency, not a
+// direct Tenant<->Bed pointer. See README's "Phase 4" section for the full
+// User -> Tenant -> Residency -> BedAllocation -> Bed chain and why each
+// layer exists separately.
 // ---------------------------------------------------------------------------
 
-// A Tenant is the PG-business record for a person staying at a property.
-// It is intentionally separate from User: a tenant may exist before they
-// ever create a login (e.g. added by an owner during offline check-in), and
-// linking to User is optional until the student app onboards them.
+// The minimal domain marker that a User is (or has been) a resident
+// somewhere, distinct from authentication (Phase 1) and from
+// identity/KYC verification (also Phase 1) - a User can log in and even be
+// KYC-verified without ever becoming a Tenant. `userId` is unique and
+// required: Phase 4 has no "offline tenant with no login" flow (that
+// would be a future guest/visit-booking concern), so every Tenant maps to
+// exactly one existing platform User, never a second identity record.
+//
+// Deliberately has no name/phone/email/status columns - those either
+// duplicate User (name/phone/email) or belong on Residency, not on the
+// tenant identity itself (status: whether *this particular stay* is
+// active is a Residency concern; a person is not "CHECKED_OUT" as a
+// person, only a specific residency is).
 model Tenant {
-  id             String       @id @default(uuid())
-  organizationId String
-  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  userId         String?      @unique
-  user           User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
-  name           String
-  phone          String
-  email          String?
-  status         TenantStatus @default(ACTIVE)
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  residencies Residency[]
+
+  @@map("tenants")
+}
+
+// "Tenant X is/was staying at Property Y during this period." Deliberately
+// does NOT mean application, booking, payment, rent, or KYC - those are
+// separate domains (some not yet built). A tenant can accumulate many
+// Residency rows over time (one per stay, at the same or different
+// properties); history is never overwritten.
+//
+// Created in PENDING - a residency is scheduled before anyone is
+// necessarily assigned a bed. Check-in (ResidenciesService.checkIn) is
+// what allocates a bed (via BedAllocation) and moves status to ACTIVE;
+// check-out moves it to CHECKED_OUT. See ResidencyStatus for the full
+// transition table.
+//
+// `startDate` is the intended/agreed move-in date, set at creation and not
+// changed by check-in. `actualEndDate` is set only by check-out, and only
+// a CHECKED_OUT residency may have one (see ResidenciesService validation).
+//
+// One-active-residency-per-tenant is enforced by a partial unique index
+// added by hand in this phase's migration SQL (Prisma's schema DSL cannot
+// express a WHERE clause on a unique index):
+//   CREATE UNIQUE INDEX residencies_active_tenant_unique
+//     ON residencies (tenant_id) WHERE status = 'ACTIVE';
+// This is the database-level backstop for "a tenant should not be
+// ACTIVE at two properties simultaneously" - the application also checks
+// this at residency-creation time, but the index is what actually
+// guarantees it under concurrent check-ins (see ResidenciesService.checkIn).
+model Residency {
+  id              String          @id @default(uuid())
+  tenantId        String
+  tenant          Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  propertyId      String
+  property        Property        @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  startDate       DateTime
+  expectedEndDate DateTime?
+  actualEndDate   DateTime?
+  status          ResidencyStatus @default(PENDING)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   allocations BedAllocation[]
+  rentPlans   RentPlan[]
+  invoices    Invoice[]
+  payments    Payment[]
 
-  @@index([organizationId])
-  @@map("tenants")
+  @@index([tenantId])
+  @@index([propertyId])
+  @@index([propertyId, status])
+  @@map("residencies")
 }
 
-// Full history of which tenant occupied which bed and when. We never
-// overwrite this record or store a single "currentBedId" on Tenant/Bed -
-// that would destroy history and make "who lived where, when" unanswerable.
+// Full history of which residency occupied which bed and when. This is the
+// layer that makes bed transfers possible without destroying history: a
+// residency can hold multiple BedAllocation rows over time (Bed A, Jan-Mar;
+// Bed B, Mar-Jun), never a single mutable `Residency.bedId` pointer. We
+// never overwrite this record - ending an allocation sets `endDate`/status,
+// it never deletes the row.
 //
-// Concurrency safety: two partial unique indexes are added by hand in the
-// generated migration SQL (Prisma's schema DSL cannot express a WHERE
-// clause on a unique index):
+// Concurrency safety: a second partial unique index is added by hand in
+// this phase's migration SQL alongside the one on `residencies` above:
 //   CREATE UNIQUE INDEX bed_allocations_active_bed_unique
 //     ON bed_allocations (bed_id) WHERE status = 'ACTIVE';
-//   CREATE UNIQUE INDEX bed_allocations_active_tenant_unique
-//     ON bed_allocations (tenant_id) WHERE status = 'ACTIVE';
-// These guarantee, at the database level, that a bed can have at most one
-// active occupant and a tenant can hold at most one active allocation, even
-// under concurrent check-in requests. The allocation service additionally
-// wraps check-in/checkout/transfer in a single Prisma transaction so a
-// partial write (e.g. ending the old allocation but failing to create the
-// new one) can never be persisted.
+// This guarantees, at the database level, that a bed can have at most one
+// active occupant even under concurrent check-in requests to the same bed -
+// see ResidenciesService.checkIn for how a resulting unique-violation is
+// translated into a safe BED_ALREADY_OCCUPIED response rather than a raw
+// database error. Check-in/checkout are additionally wrapped in a single
+// Prisma transaction so a partial write (e.g. ending the old allocation but
+// failing to create the new one) can never be persisted.
 model BedAllocation {
-  id        String              @id @default(uuid())
-  tenantId  String
-  tenant    Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  bedId     String
-  bed       Bed                 @relation(fields: [bedId], references: [id], onDelete: Cascade)
-  startDate DateTime
-  endDate   DateTime?
-  status    BedAllocationStatus @default(ACTIVE)
+  id          String              @id @default(uuid())
+  residencyId String
+  residency   Residency           @relation(fields: [residencyId], references: [id], onDelete: Cascade)
+  bedId       String
+  bed         Bed                 @relation(fields: [bedId], references: [id], onDelete: Cascade)
+  startDate   DateTime
+  endDate     DateTime?
+  status      BedAllocationStatus @default(ACTIVE)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@index([tenantId])
+  @@index([residencyId])
   @@index([bedId])
   @@map("bed_allocations")
+}
+
+// ---------------------------------------------------------------------------
+// Rent & invoices (Phase 5)
+//
+// The financial obligation layer. An Invoice is generated *because of* a
+// Residency, but a Residency is never itself the invoice, and a RentPlan is
+// never the source of truth for what a past invoice actually charged -
+// each of these is a deliberately separate concept:
+//   Residency  - "this tenant is/was staying here" (Phase 4, unchanged)
+//   RentPlan   - "this is the agreed rent rate, effective from ... to ..."
+//   Invoice    - "this is what was actually billed for one period" (a
+//                permanent, immutable-once-issued financial snapshot)
+//   InvoiceItem - one billed line within an invoice (only RENT this phase)
+// See README's "Phase 5" section for the full chain and the reasoning
+// behind each boundary.
+//
+// Money: every monetary column is `Decimal @db.Decimal(12, 2)` - never a
+// JS floating-point number - to avoid the rounding drift floats introduce
+// in financial arithmetic. Precision 12 (up to 9,999,999,999.99),
+// scale 2, rounding mode ROUND_HALF_UP wherever the application rounds
+// (see ProrationService). Currency is a plain string, defaulted to "INR"
+// and stored per-row (not a global constant) specifically so a future
+// multi-currency change is a new value written per invoice, not a schema
+// migration - Phase 5 itself only ever writes "INR".
+// ---------------------------------------------------------------------------
+
+// One row per agreed rent rate for a residency. Changing a resident's rent
+// NEVER mutates this row's `amount` - see spec section 8: history must
+// stay intact. Instead, RentPlansService.create closes out the current
+// ACTIVE plan (`effectiveTo` set, `status: INACTIVE`) and inserts a new
+// ACTIVE row in the same transaction. `amount`/`dueDay`/`effectiveFrom` are
+// therefore immutable after creation; PATCH /rent-plans/:id only ever
+// touches `dueDay` (a correction) or performs the one controlled
+// ACTIVE -> INACTIVE transition (ending a plan without a replacement) -
+// never a generic status field a client could set to anything.
+//
+// `effectiveFrom`/`effectiveTo` form a half-open interval
+// [effectiveFrom, effectiveTo) - `effectiveTo: null` means "still in
+// effect". Exactly one ACTIVE plan may exist per residency, enforced by a
+// partial unique index added by hand in this phase's migration SQL
+// (Prisma's schema DSL cannot express a WHERE clause on a unique index -
+// same limitation already documented for Residency/BedAllocation):
+//   CREATE UNIQUE INDEX rent_plans_active_residency_unique
+//     ON rent_plans ("residencyId") WHERE status = 'ACTIVE';
+model RentPlan {
+  id            String         @id @default(uuid())
+  residencyId   String
+  residency     Residency      @relation(fields: [residencyId], references: [id], onDelete: Cascade)
+  amount        Decimal        @db.Decimal(12, 2)
+  currency      String         @default("INR")
+  billingCycle  BillingCycle   @default(MONTHLY)
+  // Day of the month rent is due (1-31). A month without that day (e.g.
+  // dueDay=31 in February) deterministically falls back to that month's
+  // last day - see InvoicesService.computeDueDate.
+  dueDay        Int
+  effectiveFrom DateTime
+  effectiveTo   DateTime?
+  status        RentPlanStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoices Invoice[]
+
+  @@index([residencyId])
+  @@index([residencyId, status])
+  @@map("rent_plans")
+}
+
+// A permanent financial record - "how much this resident owed for this
+// billing period" - never recalculated from the current RentPlan (spec
+// section 11: `subtotal`/`discount`/`tax`/`total` are the actual snapshot
+// values used at generation time, even if `rentPlan.amount` changes
+// afterward). `rentPlanId` is kept only for audit traceability ("which
+// plan produced this") and is nullable with `onDelete: SetNull` - it is
+// never read back to reconstruct a total.
+//
+// `invoiceNumber` is the human-facing identifier (e.g. "INV-2027-000001"),
+// generated from a Postgres sequence (`invoice_number_seq`, created by
+// hand in this phase's migration SQL) - never `COUNT(*) + 1`, which races
+// under concurrent generation. See InvoicesService.generateInvoiceNumber.
+//
+// `status` lifecycle: DRAFT -> ISSUED -> OVERDUE (lazily, on read, past
+// dueDate) -> (any of DRAFT/ISSUED/OVERDUE) -> VOID. VOID is terminal -
+// spec section 17/23 explicitly do not support re-issuing a voided
+// invoice; a correction is a new invoice, not a resurrected one.
+//
+// One rent invoice per residency per billing period is enforced by a
+// plain (non-partial) unique constraint, since Prisma's schema DSL can
+// express this one directly - no hand-written SQL needed here.
+model Invoice {
+  id                 String        @id @default(uuid())
+  residencyId        String
+  residency          Residency     @relation(fields: [residencyId], references: [id], onDelete: Cascade)
+  rentPlanId         String?
+  rentPlan           RentPlan?     @relation(fields: [rentPlanId], references: [id], onDelete: SetNull)
+  invoiceNumber      String        @unique
+  billingPeriodStart DateTime
+  billingPeriodEnd   DateTime
+  issueDate          DateTime?
+  dueDate            DateTime
+  subtotal           Decimal       @db.Decimal(12, 2)
+  discount           Decimal       @db.Decimal(12, 2) @default(0)
+  tax                Decimal       @db.Decimal(12, 2) @default(0)
+  total              Decimal       @db.Decimal(12, 2)
+  currency           String        @default("INR")
+  status             InvoiceStatus @default(DRAFT)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items       InvoiceItem[]
+  payments    Payment[]
+  allocations PaymentAllocation[]
+
+  // "One rent invoice per residency per billing period" (spec section 13).
+  // Named explicitly rather than relying on Prisma's auto-generated name,
+  // since the application catches a P2002 on this exact constraint by
+  // name to translate it into DUPLICATE_BILLING_PERIOD - see
+  // InvoicesService.generateForResidency.
+  @@unique([residencyId, billingPeriodStart, billingPeriodEnd], name: "invoices_residency_billing_period_unique")
+  @@index([residencyId, status])
+  @@index([dueDate, status])
+  @@map("invoices")
+}
+
+// One billed line within an invoice. `amount` is always the authoritative
+// snapshot value (`quantity * unitAmount`, computed server-side) - the
+// server calculates every financial field; a client never supplies
+// subtotal/tax/total or a line amount directly (spec section 35).
+model InvoiceItem {
+  id          String          @id @default(uuid())
+  invoiceId   String
+  invoice     Invoice         @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  description String
+  itemType    InvoiceItemType @default(RENT)
+  quantity    Int             @default(1)
+  unitAmount  Decimal         @db.Decimal(12, 2)
+  amount      Decimal         @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([invoiceId])
+  @@map("invoice_items")
+}
+
+// ---------------------------------------------------------------------------
+// Tenant payments, platform fee & owner settlement (Phase 6)
+//
+// Two separate money flows exist in this business, and this section models
+// only one of them - a tenant paying PG rent:
+//   Tenant --[Payment: gross amount]--> Platform --[fee retained]-->
+//     PG Owner (the remainder, via OwnerSettlement)
+// The other flow - an owner paying this platform a SaaS subscription - is
+// a completely separate future domain (Phase 7) and shares no model with
+// this section on purpose (see README's "Phase 6" section).
+//
+// Chain: Residency -> Invoice (Phase 5, unchanged) -> Payment (an attempt/
+// transaction to pay that invoice) -> PaymentAllocation (how much of that
+// payment actually counted toward the invoice's balance) -> OwnerSettlement
+// (the owner's share of a captured payment, tracked separately - "the
+// tenant paid" and "the owner was paid out" are different facts, see
+// OwnerSettlement's own doc comment).
+// ---------------------------------------------------------------------------
+
+// One payment attempt/transaction against exactly one Invoice. `amount` is
+// always the gross amount the tenant is charged (spec section 17 - the
+// platform fee is never subtracted from this field); `platformFee` and
+// `ownerSettlementAmount` are recorded alongside it as an explicit
+// breakdown, not derived on read, so the historical record survives a
+// later change to the platform's fee rule. Both are server-calculated at
+// order-creation time - a client never supplies them (spec section 28).
+//
+// A Payment only ever becomes a PaymentAllocation (i.e. counts toward the
+// invoice's paid balance) once `status` reaches CAPTURED - see
+// PaymentsService.finalizeCapturedPayment. `organizationId`/`propertyId`/
+// `residencyId` are denormalized from the invoice at creation time (never
+// re-derived from a possibly-different current invoice state later) so a
+// payment can never be queried into the wrong PG in a multi-PG
+// organization (spec sections 23-24), and so a payment's own organization
+// scope survives even if the invoice were ever reassigned (it is not, but
+// the columns make that assumption explicit rather than implicit).
+model Payment {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId     String
+  property       Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  residencyId    String
+  residency      Residency @relation(fields: [residencyId], references: [id], onDelete: Cascade)
+  invoiceId      String
+  invoice        Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  payerUserId    String
+  payerUser      User     @relation(fields: [payerUserId], references: [id], onDelete: Cascade)
+
+  amount                Decimal       @db.Decimal(12, 2)
+  currency              String        @default("INR")
+  platformFee           Decimal       @db.Decimal(12, 2) @default(0)
+  ownerSettlementAmount Decimal       @db.Decimal(12, 2) @default(0)
+
+  // Populated from the gateway once known (e.g. "card", "upi",
+  // "netbanking") - never client-supplied at order-creation time.
+  method   String?
+  status   PaymentStatus   @default(CREATED)
+  provider PaymentProvider @default(RAZORPAY)
+
+  // Unique "where applicable" (spec section 38) - null until the gateway
+  // assigns one, which is exactly when it must be unique.
+  providerOrderId   String? @unique
+  providerPaymentId String? @unique
+
+  // Client-supplied `Idempotency-Key` header (spec section 34), stored so
+  // a retried order-creation request (network timeout, app restart) can be
+  // recognized and answered with the original Payment instead of creating
+  // a second one. Null for callers that don't send the header - not
+  // enforced as the only idempotency mechanism (see PaymentsService).
+  idempotencyKey String? @unique
+
+  failureCode    String?
+  failureMessage String?
+  paidAt         DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  allocations PaymentAllocation[]
+  settlement  OwnerSettlement?
+  refunds     Refund[]
+
+  @@index([organizationId])
+  @@index([propertyId])
+  @@index([residencyId])
+  @@index([invoiceId])
+  @@index([payerUserId])
+  @@map("payments")
+}
+
+// How much of a given Payment actually counts toward a given Invoice's
+// paid balance - kept as its own table (never a column on Payment) so an
+// invoice's outstanding balance is always computed the same deterministic
+// way regardless of how many payments have been attempted against it:
+// `Invoice.total - SUM(PaymentAllocation.amount for CAPTURED payments)`
+// (see PaymentsService.getOutstandingBalance). A failed/cancelled payment
+// never gets an allocation row; a refund does not delete one (deleting
+// history is never how this project represents a reversal - see
+// BedAllocation/RentPlan for the same principle applied elsewhere) but
+// instead the owning Payment's status moves to REFUNDED/
+// PARTIALLY_REFUNDED and PaymentsService excludes refunded amounts from
+// the balance calculation from that point on.
+//
+// `@@unique([paymentId, invoiceId])` prevents a duplicate allocation for
+// the same payment/invoice pair (spec section 38) - relevant because
+// webhook processing is idempotent and must never double-allocate a
+// payment it has already finalized.
+model PaymentAllocation {
+  id        String  @id @default(uuid())
+  paymentId String
+  payment   Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  amount    Decimal @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+
+  @@unique([paymentId, invoiceId], name: "payment_allocations_payment_invoice_unique")
+  @@index([invoiceId])
+  @@map("payment_allocations")
+}
+
+// The platform's fee rule, deliberately just FIXED for Phase 6 (spec
+// section 19-20). PlatformFeeService reads the single currently-active
+// row (`isActive: true`, most recently created) rather than any code
+// ever hardcoding an amount - so the business rule can change later by
+// inserting a new row (and deactivating the old one), never a
+// deployment. Historical Payments are unaffected by a later change here
+// because `Payment.platformFee` is a snapshot, not a live lookup (see
+// Payment's own doc comment).
+model PlatformFeeRule {
+  id        String          @id @default(uuid())
+  feeType   PlatformFeeType @default(FIXED)
+  // For feeType FIXED: the flat fee amount charged per successful payment
+  // (e.g. "1.00"). No percentage field exists yet - see PlatformFeeType.
+  amount    Decimal         @db.Decimal(12, 2)
+  isActive  Boolean         @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive])
+  @@map("platform_fee_rules")
+}
+
+// Where a PG owner's settled funds actually go - the gateway's own
+// account/onboarding construct (e.g. a Razorpay Route "linked account"),
+// never raw bank/card details (spec section 22). Scoped to
+// `organizationId` (one per organization, `@@unique`) rather than per
+// property: spec section 24 explicitly asks for "one organization -> one
+// settlement account -> multiple properties" as the Phase 6 default,
+// without hardcoding "one property = one owner account" - scoping this
+// at the organization level (not adding a propertyId at all) is what
+// keeps a future per-property override possible as a schema addition
+// later, never a required rewrite of this table.
+model OwnerPaymentAccount {
+  id                 String                    @id @default(uuid())
+  organizationId     String                    @unique
+  organization       Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  provider           PaymentProvider           @default(RAZORPAY)
+  providerAccountId  String                    @unique
+  status             OwnerPaymentAccountStatus @default(PENDING)
+  onboardingStatus   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  settlements OwnerSettlement[]
+
+  @@map("owner_payment_accounts")
+}
+
+// "The owner's share of a captured payment was transferred" - a
+// deliberately separate fact from "the tenant successfully paid"
+// (Payment.status = CAPTURED). Spec section 36 is explicit that these
+// must never be confused: a Payment can be CAPTURED while its
+// OwnerSettlement is still PENDING/PROCESSING, and a settlement can FAIL
+// without that ever changing the tenant-facing Payment status - the
+// tenant already paid; a delayed or failed payout is purely a
+// platform/owner-side operational concern. `@@unique` on `paymentId`
+// prevents the same captured payment from ever producing two settlement
+// records (spec sections 38/44). `providerTransferId` is unique "where
+// present" (null until the gateway confirms a transfer).
+model OwnerSettlement {
+  id                    String              @id @default(uuid())
+  paymentId             String              @unique
+  payment               Payment             @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  organizationId        String
+  organization          Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ownerPaymentAccountId String?
+  ownerPaymentAccount   OwnerPaymentAccount? @relation(fields: [ownerPaymentAccountId], references: [id], onDelete: SetNull)
+
+  grossAmount       Decimal @db.Decimal(12, 2)
+  platformFee       Decimal @db.Decimal(12, 2)
+  settlementAmount  Decimal @db.Decimal(12, 2)
+  currency          String  @default("INR")
+
+  providerTransferId String?          @unique
+  status             SettlementStatus @default(PENDING)
+  settledAt          DateTime?
+  failureReason      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId])
+  @@index([status])
+  @@map("owner_settlements")
+}
+
+// A tenant-initiated refund against a previously CAPTURED payment (spec
+// section 37). Deliberately its own table, never a mutation of Payment's
+// own amount field - a refund is a new financial event, not an edit to
+// history. `amount` may be less than the original `Payment.amount`
+// (partial refund). If the underlying payment's OwnerSettlement had
+// already reached PROCESSING/SETTLED, PaymentsService marks that
+// settlement REVERSED as an accounting flag - actually recovering funds
+// already paid out to the owner is a gateway-specific capability (e.g. a
+// reversal/deduction on the owner's linked account) that Phase 6 does not
+// invent or assume; see README's "Phase 6" section and the Final Report's
+// "known limitations" for what is and isn't handled here.
+model Refund {
+  id                String       @id @default(uuid())
+  paymentId         String
+  payment           Payment      @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  amount            Decimal      @db.Decimal(12, 2)
+  reason            String?
+  status            RefundStatus @default(PENDING)
+  providerRefundId  String?      @unique
+  failureReason     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([paymentId])
+  @@map("refunds")
+}
+
+// Every inbound gateway webhook call, persisted before any business logic
+// runs. `@@unique([provider, eventId])` is what actually makes webhook
+// processing idempotent under a genuine duplicate delivery (spec sections
+// 31-33) - a repeated webhook's insert raises a unique violation, caught
+// and treated as "already processed, acknowledge and no-op" rather than
+// re-running any financial side effect. `payload` retains the full
+// verified body for later reconciliation/debugging (spec section 40) -
+// never re-fetched from the gateway after the fact.
+model WebhookEvent {
+  id          String          @id @default(uuid())
+  provider    WebhookProvider @default(RAZORPAY)
+  eventId     String
+  eventType   String
+  payload     Json
+  processedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@unique([provider, eventId], name: "webhook_events_provider_event_unique")
+  @@map("webhook_events")
 }
