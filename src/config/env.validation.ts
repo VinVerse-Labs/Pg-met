@@ -31,4 +31,12 @@ export const envValidationSchema = Joi.object({
   // application code (see SubscriptionsService).
   DEFAULT_TRIAL_DAYS: Joi.number().integer().min(0).default(30),
   SUBSCRIPTION_GRACE_PERIOD_DAYS: Joi.number().integer().min(0).default(7),
+
+  // Platform admin bootstrap (Phase 8). Optional - when set, the user with
+  // this email is idempotently promoted to SUPER_ADMIN on every boot (see
+  // src/bootstrap/super-admin.bootstrap.ts). There is no public Super
+  // Admin registration endpoint; this is the only mechanism that grants
+  // the role, and it never creates a user - it only promotes one that
+  // already registered normally.
+  SUPER_ADMIN_EMAIL: Joi.string().email().optional().allow(''),
 });

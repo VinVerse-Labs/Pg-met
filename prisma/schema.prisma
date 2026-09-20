@@ -375,6 +375,7 @@ model User {
   tenant                Tenant?
   identityVerifications IdentityVerification[]
   payments              Payment[]
+  auditLogs             AuditLog[]
 
   @@map("users")
 }
@@ -1314,4 +1315,43 @@ model SubscriptionPayment {
   @@index([subscriptionId])
   @@index([subscriptionInvoiceId])
   @@map("subscription_payments")
+}
+
+// ---------------------------------------------------------------------------
+// Platform admin (Phase 8)
+//
+// The Super Admin domain sits *above* every organization - it does not add
+// a new organization-membership role (spec: "do NOT add SUPER_ADMIN to the
+// existing organization membership role enum") and reuses
+// `User.platformRole` (`PlatformRole.SUPER_ADMIN`), already present since
+// Phase 1 for exactly this purpose. This section adds only what Phase 1-7
+// genuinely lack: a durable record of sensitive platform-admin actions.
+// ---------------------------------------------------------------------------
+
+// One row per sensitive platform-admin action (spec: "audit Super Admin
+// login, organization suspension/activation, plan creation/change/
+// deactivation, manual subscription intervention"). `action` is a plain
+// string, not an enum, deliberately - unlike a domain status field, the
+// set of auditable actions grows independently of any state machine and
+// a new one should never need a migration. `organizationId` is nullable
+// because not every action is organization-scoped (e.g. a SaaS plan
+// change affects no single organization). `metadata` never contains
+// secrets/passwords/tokens - see AuditLogService's doc comment.
+model AuditLog {
+  id             String   @id @default(uuid())
+  actorUserId    String
+  actorUser      User     @relation(fields: [actorUserId], references: [id], onDelete: Cascade)
+  action         String
+  entityType     String
+  entityId       String
+  organizationId String?
+  metadata       Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([actorUserId])
+  @@index([organizationId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
 }

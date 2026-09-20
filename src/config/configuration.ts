@@ -30,7 +30,12 @@ export const subscriptionConfig = registerAs('subscription', () => ({
   ),
 }));
 
+export const platformAdminConfig = registerAs('platformAdmin', () => ({
+  superAdminEmail: process.env.SUPER_ADMIN_EMAIL || null,
+}));
+
 export type AppConfig = ReturnType<typeof appConfig>;
 export type JwtConfig = ReturnType<typeof jwtConfig>;
 export type RazorpayConfig = ReturnType<typeof razorpayConfig>;
 export type SubscriptionConfig = ReturnType<typeof subscriptionConfig>;
+export type PlatformAdminConfig = ReturnType<typeof platformAdminConfig>;

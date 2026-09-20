@@ -1,17 +1,17 @@
 import { HttpStatus, Injectable } from '@nestjs/common';
-import { SaasPlan } from '@prisma/client';
+import { Prisma, SaasPlan } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import { AppException } from '../../common/exceptions/app.exception';
 import { ErrorCode } from '../../common/constants/error-code.enum';
 import { SaasPlanResponseDto } from './dto/saas-plan-response.dto';
+import { CreateSaasPlanDto } from './dto/create-saas-plan.dto';
+import { UpdateSaasPlanDto } from './dto/update-saas-plan.dto';
 
-// Deliberately minimal (spec: "administrative plan management can be
-// deferred... do NOT build a full platform-admin system in Phase 7") -
-// only what's needed for an owner to see what plans exist and for
-// SubscriptionsService to resolve a plan by id. No create/update/delete
-// endpoint exists; new plans are added by inserting a row directly
-// (see SaasPlan's doc comment in schema.prisma) until a real admin
-// surface is a requirement.
+// Phase 7 kept this deliberately minimal (read-only: no admin
+// create/update/delete). Phase 8 adds the admin-only mutation methods
+// below (adminCreate/adminUpdate/adminDeactivate) - `findActive`/
+// `getDefaultActivePlan`/`getActiveByIdOrThrow` are unchanged from Phase
+// 7 and remain the only methods a non-admin caller's code path reaches.
 @Injectable()
 export class SaasPlansService {
   constructor(private readonly prisma: PrismaService) {}
@@ -59,5 +59,87 @@ export class SaasPlansService {
       );
     }
     return plan;
+  }
+
+  // --- Platform admin (Phase 8) ---
+
+  async adminFindAll(): Promise<SaasPlanResponseDto[]> {
+    const plans = await this.prisma.saasPlan.findMany({
+      orderBy: { createdAt: 'desc' },
+    });
+    return plans.map(SaasPlanResponseDto.fromEntity);
+  }
+
+  async adminFindOneOrThrow(planId: string): Promise<SaasPlanResponseDto> {
+    const plan = await this.prisma.saasPlan.findUnique({
+      where: { id: planId },
+    });
+    if (!plan) {
+      throw new AppException(
+        ErrorCode.SAAS_PLAN_NOT_FOUND,
+        'SaaS plan not found.',
+        HttpStatus.NOT_FOUND,
+      );
+    }
+    return SaasPlanResponseDto.fromEntity(plan);
+  }
+
+  // A brand-new row every time (spec: "if the price changes... use
+  // versioning/effective dates or create a new plan version") - never an
+  // in-place price edit. `price` is set exactly once, at creation, and
+  // `adminUpdate` below cannot touch it.
+  async adminCreate(dto: CreateSaasPlanDto): Promise<SaasPlanResponseDto> {
+    const plan = await this.prisma.saasPlan.create({
+      data: {
+        name: dto.name,
+        description: dto.description,
+        price: new Prisma.Decimal(dto.price),
+        currency: dto.currency ?? 'INR',
+      },
+    });
+    return SaasPlanResponseDto.fromEntity(plan);
+  }
+
+  // Deliberately cannot touch `price`/`currency` - `UpdateSaasPlanDto`
+  // has no field for either, so there is no way for this method to ever
+  // be asked to mutate a value a historical `SubscriptionInvoice` has
+  // already snapshotted (spec: "historical pricing MUST remain
+  // immutable"). Only cosmetic fields (`name`/`description`) are mutable
+  // in place.
+  async adminUpdate(
+    planId: string,
+    dto: UpdateSaasPlanDto,
+  ): Promise<SaasPlanResponseDto> {
+    await this.adminFindOneOrThrow(planId);
+    const plan = await this.prisma.saasPlan.update({
+      where: { id: planId },
+      data: { name: dto.name, description: dto.description },
+    });
+    return SaasPlanResponseDto.fromEntity(plan);
+  }
+
+  async adminDeactivate(planId: string): Promise<SaasPlanResponseDto> {
+    const existing = await this.prisma.saasPlan.findUnique({
+      where: { id: planId },
+    });
+    if (!existing) {
+      throw new AppException(
+        ErrorCode.SAAS_PLAN_NOT_FOUND,
+        'SaaS plan not found.',
+        HttpStatus.NOT_FOUND,
+      );
+    }
+    if (existing.status === 'INACTIVE') {
+      throw new AppException(
+        ErrorCode.SAAS_PLAN_ALREADY_INACTIVE,
+        'This plan is already inactive.',
+        HttpStatus.CONFLICT,
+      );
+    }
+    const plan = await this.prisma.saasPlan.update({
+      where: { id: planId },
+      data: { status: 'INACTIVE', effectiveTo: new Date() },
+    });
+    return SaasPlanResponseDto.fromEntity(plan);
   }
 }

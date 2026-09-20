@@ -9,6 +9,7 @@ import { AppModule } from './app.module';
 import { JsonLoggerService } from './common/logger/json-logger.service';
 import { PrismaService } from './database/prisma.service';
 import { AppConfig } from './config/configuration';
+import { promoteSuperAdminIfConfigured } from './bootstrap/super-admin.bootstrap';
 
 const BODY_SIZE_LIMIT = '1mb';
 
@@ -48,6 +49,7 @@ async function bootstrap(): Promise<void> {
 
   const prismaService = app.get(PrismaService);
   await prismaService.enableShutdownHooks(app);
+  await promoteSuperAdminIfConfigured(app);
 
   if (nodeEnv !== 'production') {
     const swaggerConfig = new DocumentBuilder()

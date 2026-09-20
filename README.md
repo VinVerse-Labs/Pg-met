@@ -7,7 +7,7 @@ This repository is backend-only. The mobile apps (owner/manager and
 student) are separate React Native / Expo projects and are not part of
 this codebase.
 
-## Status: Phase 7 - Owner SaaS Subscription
+## Status: Phase 8 - Super Admin / Founder Platform Management
 
 Phase 0 delivered the foundation: project setup, configuration, database
 connectivity, the core multi-tenant data model, global error handling,
@@ -43,22 +43,31 @@ fee, and the remainder is tracked as a separate owner settlement.
 `OwnerSettlement`, `Refund`, and `WebhookEvent` all belong to that
 tenant-rent flow.
 
-Phase 7 (this repository, current) adds the platform's *other* money
-flow: the PG owner paying **this platform** a monthly SaaS subscription,
-completely separate from Phase 6's tenant-rent payments (see "Two
-separate money flows" in "Phase 7" below - no model, service, or
-endpoint is shared between them). New this phase: `SaasPlan`,
-`OrganizationSubscription` (one per organization; `TRIAL -> ACTIVE ->
-RENEWAL_DUE -> GRACE_PERIOD -> SUSPENDED`, or `CANCELLED`),
-`SubscriptionInvoice` (a monthly, system-generated, price-snapshotted
-bill), and `SubscriptionPayment` (a Razorpay payment against one such
-invoice - no platform fee, no owner settlement, since the owner is
-paying the platform directly). Phase 7 intentionally does **not**
-include automatic recurring Razorpay subscriptions, SaaS refunds,
-coupons/promotions, a tax/GST engine, platform-admin plan management, PG
-applications, visit booking, complaints, food, notifications, the
-student marketplace, or roommate matching (see "Known limitations" in
-"Phase 7" below and "Roadmap").
+Phase 7 added the platform's *other* money flow: the PG owner paying
+**this platform** a monthly SaaS subscription, completely separate from
+Phase 6's tenant-rent payments. `SaasPlan`, `OrganizationSubscription`
+(`TRIAL -> ACTIVE -> RENEWAL_DUE -> GRACE_PERIOD -> SUSPENDED`, or
+`CANCELLED`), `SubscriptionInvoice`, and `SubscriptionPayment` all belong
+to that flow.
+
+Phase 8 (this repository, current) adds the platform operator's own view
+*above* every organization: a `PlatformRole.SUPER_ADMIN` (already present
+since Phase 1, now actually used) can list/inspect every organization,
+owner, property, and subscription on the platform; suspend/activate an
+organization at the platform level (deliberately distinct from Phase 7's
+subscription suspension - see "Phase 8" below); manage the `SaasPlan`
+catalog; and see platform-wide dashboards that keep tenant-rent volume,
+platform fees, owner settlements, and SaaS revenue clearly and separately
+labeled - never combined into one "revenue" number. New this phase: a
+reusable `PlatformAdminGuard`, a durable `AuditLog` for sensitive admin
+actions, and a `SUPER_ADMIN_EMAIL`-driven bootstrap mechanism (no public
+Super Admin registration endpoint exists, or ever will). Phase 8
+intentionally does **not** include a platform-admin UI, SaaS coupons/
+promotions, a full plan-versioning history table, wiring the new
+suspension-access policy into every existing Phase 0-6 controller (a
+deliberately flagged gap - see "Known limitations" below), PG
+applications, visit booking, complaints, food, notifications, the student
+marketplace, or roommate matching (see "Roadmap").
 
 ## Tech stack
 
@@ -204,10 +213,13 @@ src/
     ├── invoices/             # Invoice generation/lifecycle - the only Invoice/InvoiceItem creation path
     ├── payments/             # Tenant payment orders/verification/webhook, platform fee, owner settlement
     │   └── gateway/            # PaymentGateway interface + RazorpayGatewayService (shared by Phase 6 and 7)
-    ├── saas-plans/           # SaasPlan lookup - deliberately no admin create/update/delete endpoint yet
+    ├── saas-plans/           # SaasPlan lookup + Phase 8's admin-only create/update/deactivate
     ├── subscriptions/        # OrganizationSubscription lifecycle state machine + access policy
     ├── subscription-invoices/  # SubscriptionInvoice generation/lookup - system-generated, never owner-authored
-    └── subscription-payments/  # SubscriptionPayment orders/verification - the owner paying the platform
+    ├── subscription-payments/  # SubscriptionPayment orders/verification - the owner paying the platform
+    ├── audit-log/            # AuditLogService - the one place a sensitive admin action is recorded
+    ├── platform-admin/       # Super Admin: organizations/owners/properties/subscriptions/SaaS plans, PlatformAdminGuard
+    └── platform-analytics/   # Database-aggregated platform dashboard/revenue/occupancy/tenant-payment metrics
 ```
 
 `complaints, food, announcements, notifications` do not exist as modules
@@ -269,6 +281,19 @@ just be structure for its own sake.
   `target` for a plain schema-declared `@@unique` comes back as the
   *column names*, not the constraint's given name, against real
   Postgres - a mismatch a mocked unit test alone would never surface.
+- **Even a single boolean-ish status flag needs an atomic conditional
+  update under concurrency, not "read, check, then write."** Phase 8's
+  organization suspend/activate looked safe with a plain
+  find-then-update, but two concurrent suspend calls could both read
+  `status: ACTIVE` before either wrote - caught by running exactly that
+  scenario against real Postgres (spec's own "Test 5: concurrent admin
+  state change"). The fix folds the expected prior status into
+  `updateMany`'s own `WHERE` clause so the transition itself is the
+  atomic unit - the same "let the database clause be the real guarantee"
+  principle as every other concurrency fix in this project, just without
+  needing a unique index or a row lock this time, since the invariant is
+  "at most one caller may flip this one flag," not an aggregate over many
+  rows. See "Phase 8" below.
 - **Bed allocation is an append-only history, not a `currentBedId`
   pointer.** `BedAllocation` rows are never overwritten; ending a stay
   sets `endDate`/`status`, it never deletes the row. The "two tenants, one
@@ -314,7 +339,7 @@ just be structure for its own sake.
   enough real nullability (optional email, nullable `endDate`, ...) that
   loose null checking would hide real bugs.
 
-## Data model (Phase 0 through Phase 7)
+## Data model (Phase 0 through Phase 8)
 
 ```
 Organization (status: ACTIVE | INACTIVE | SUSPENDED)
@@ -344,13 +369,15 @@ Organization (status: ACTIVE | INACTIVE | SUSPENDED)
 
 PlatformFeeRule (global, not per-organization - see "Phase 6" below)
 WebhookEvent (provider + eventId, globally unique - shared by Phase 6 and 7)
-SaasPlan (global catalog - see "Phase 7" below)
+SaasPlan (global catalog - see "Phase 7" below; Phase 8 adds admin create/update/deactivate)
+AuditLog (global - actorUserId + action + entityType/entityId + optional organizationId - see "Phase 8" below)
 
 User ──< OrganizationMembership >── Organization
 User ──(1:1)── Tenant ──< Residency
 User ──< Payment                 (Phase 6: payerUserId - always the tenant)
 User ──< RefreshToken            (Phase 1: one row per active session/device)
 User ──< IdentityVerification    (Phase 1: KYC foundation)
+User ──< AuditLog                (Phase 8: actorUserId - always a SUPER_ADMIN)
 ```
 
 - `User` is pure identity (phone/email/name/password hash). It has no
@@ -508,6 +535,20 @@ User ──< IdentityVerification    (Phase 1: KYC foundation)
   delivers both tenant-rent and SaaS-subscription events to the same
   merchant account's one webhook URL. See "Phase 7" below for how
   `PaymentsWebhookService` tells the two domains apart.
+- Phase 8 adds **no new role at all** to `OrganizationMembership.role` -
+  the spec is explicit that `SUPER_ADMIN` must never be confused with
+  `OWNER`/`MANAGER`/`STAFF`/`STUDENT`, and this project already had the
+  right column for it: `User.platformRole` (`PlatformRole.SUPER_ADMIN`),
+  present since Phase 1 for exactly the SUPER_ADMIN-bypass checks every
+  phase's services already contain. Phase 8 is the first phase to build
+  real functionality *for* that role, not the phase that introduces it.
+- `AuditLog.action` is a plain string, not an enum - unlike a domain
+  status field, the set of auditable admin actions grows independently of
+  any state machine, and a new one should never need a migration.
+  `organizationId` is nullable because not every audited action is
+  organization-scoped (e.g. a `SaasPlan` change affects no single
+  organization). Every write goes through `AuditLogService.record` -
+  there is no endpoint that accepts a client-submitted audit entry.
 
 ## Roles
 
@@ -716,6 +757,61 @@ stays at a PG.
   id; (4) two concurrent finalization attempts against an
   already-`PAID` invoice resolved to zero `CAPTURED` payments - no
   duplicate successful payment against an invalid invoice.
+- From Phase 8: `platform-admin.guard.spec.ts` (SUPER_ADMIN allowed;
+  every other `platformRole` value, and a missing user, rejected with the
+  `PLATFORM_ADMIN_ACCESS_DENIED` 404 - never a 403, matching the guard's
+  own "hide resource existence" doc comment), `super-admin.bootstrap
+  .spec.ts` (does nothing when unconfigured, promotes a matching
+  not-yet-admin user, is idempotent against an already-promoted one, and
+  never creates a user when none matches), `audit-log.service.spec.ts`
+  (writes exactly the given fields, defaults a missing `organizationId`
+  to `null`, paginates and filters by action/organization),
+  `saas-plans.service.spec.ts` gained cases for `adminCreate` (a new row,
+  never a mutation), `adminUpdate` (only `name`/`description` ever reach
+  the update call - `price`/`currency` cannot appear even if a caller's
+  DTO somehow carried them), and `adminDeactivate` (including rejecting
+  an already-inactive plan), and `platform-admin.service.spec.ts`/
+  `platform-analytics.service.spec.ts` cover organization list/detail/
+  suspend/activate (including the not-found and already-suspended/active
+  branches, and a concurrency-shaped test for the atomic `updateMany`
+  guard), owner/property/subscription list and detail shaping, and the
+  revenue/occupancy/tenant-payment aggregations (asserting every
+  "collected" aggregate query filters on `status: 'CAPTURED'`, and that
+  missing data resolves to `"0"`, never `null`/`undefined`).
+  `test/phase8-platform-admin.e2e-spec.ts` exercises the full SUPER_ADMIN/
+  OWNER/MANAGER/STAFF/outsider authorization matrix over HTTP (every
+  non-admin role gets the same `404 PLATFORM_ADMIN_ACCESS_DENIED`), the
+  organization suspend/activate lifecycle with its audit-log trail, and
+  SaaS plan admin CRUD including proving `price` is rejected by the
+  global `ValidationPipe`'s `forbidNonWhitelisted` the moment a `PATCH`
+  tries to include it - immutability enforced at the DTO boundary, not
+  just by service logic. This suite's fake deliberately does not attempt
+  to simulate Prisma's `groupBy`/raw-SQL aggregation (the dashboard/
+  revenue/occupancy endpoints) - those are proven against real Postgres
+  instead, described next.
+- All five of the spec's mandatory real-Postgres scenarios were run
+  directly against the live database with a one-off script: (1) platform
+  isolation - a SUPER_ADMIN's organization list included two freshly
+  created organizations, while each one's own OWNER's membership rows
+  showed exactly their own organization; (2) organization suspension
+  proven independent of subscription status - suspending an organization
+  whose `OrganizationSubscription.status` was `ACTIVE` left the
+  subscription row completely untouched (`Organization.status:
+  SUSPENDED`, `OrganizationSubscription.status: ACTIVE`, simultaneously);
+  (3) revenue accuracy - the dashboard's `saasRevenueCollected` matched a
+  direct `SUM(amount) WHERE status = 'CAPTURED'` query byte-for-byte
+  after seeding a known payment; (4) historical plan pricing - deactivating
+  a `SaasPlan` and creating a new one at a higher price left a previously
+  issued `SubscriptionInvoice` referencing the old plan completely
+  unchanged (`total` still `499`, not `699`); (5) concurrent admin state
+  change - this run is what **caught a real concurrency bug**: two
+  simultaneous `suspendOrganization` calls for the same organization both
+  originally succeeded (a plain find-then-update race), which the fix
+  described in "Key decisions" above closed by folding the expected prior
+  status into `updateMany`'s own `WHERE` clause - re-run after the fix,
+  exactly one call succeeded and the other correctly received
+  `ORGANIZATION_ALREADY_SUSPENDED`, with a single deterministic final
+  `SUSPENDED` state.
 
 ## Environment variables
 
@@ -2224,13 +2320,217 @@ and the column set, the same defensive pattern Phase 6 established.
   (spec: "prefer deferring SaaS refunds if not explicitly required") -
   `SubscriptionPaymentStatus` includes `REFUNDED` in the enum for future
   use, but no code path sets it.
-- **No coupons/promotions, tax/GST engine, or platform-admin plan
-  management.** `SubscriptionInvoice.tax` is always `0`, stored and ready
-  for a future calculation; `SaasPlansService` has no create/update/
-  delete endpoint (a new plan is added by inserting a row directly, per
-  its own doc comment).
+- **No coupons/promotions or tax/GST engine.**
+  `SubscriptionInvoice.tax` is always `0`, stored and ready for a future
+  calculation. (Platform-admin plan management itself was delivered in
+  Phase 8 - see below.)
 - **`SubscriptionAccessGuard` is not wired into any Phase 0-6 route** -
-  see "Suspension" above.
+  see "Suspension" above. (Phase 8 added a separate, *organization-level*
+  suspension that *is* fully wired in, through the existing
+  `MembershipsService` chokepoint - see "Phase 8" below for why these are
+  two different mechanisms.)
+
+## Phase 8: Super Admin / platform management
+
+### The role: reused, not reinvented
+
+Phase 8's spec is explicit that `SUPER_ADMIN` must never be confused with
+`OWNER`/`MANAGER`/`STAFF`/`STUDENT`, and must never be added to
+`OrganizationMembership.role`. This project already had the right place
+for it: `User.platformRole` (`PlatformRole.SUPER_ADMIN`), present since
+Phase 1 specifically so every phase's services could bypass their own
+organization-scoped authorization for a platform operator (`if
+(user.platformRole === 'SUPER_ADMIN') return;` appears in
+`MembershipsService`, every "reuse the layer above" chokepoint, and
+Phase 5-7's own BOLA lookups). Phase 8 adds no new identity concept at
+all - it is the first phase to build a real *surface* for a role this
+project has quietly supported since the beginning.
+
+```
+User.platformRole: SUPER_ADMIN | USER      (Phase 1 - platform-wide, one value per user)
+OrganizationMembership.role:                (Phase 2 - one row per user per organization)
+  OWNER | MANAGER | STAFF | STUDENT
+```
+
+A user's `platformRole` and their `OrganizationMembership.role` in any
+given organization are completely independent facts - a platform
+`SUPER_ADMIN` is not automatically an `OWNER` of anything, and an
+`OWNER`, however senior in their own organization, is never granted
+`SUPER_ADMIN` by that role (spec: "a user being OWNER must NEVER
+automatically give them SUPER_ADMIN").
+
+### Authorization: one guard, applied uniformly
+
+`PlatformAdminGuard` checks exactly one thing -
+`AuthenticatedUser.platformRole === 'SUPER_ADMIN'` - and is the only
+authorization mechanism every controller under `/admin/*` uses (spec:
+"do NOT check membership.role === OWNER for platform administration").
+A non-admin caller, including an `OWNER`, receives `404
+PLATFORM_ADMIN_ACCESS_DENIED` - not `403` - hiding the existence of the
+entire admin API surface the same way every cross-tenant lookup in this
+project already hides resource existence (spec: "do not leak the
+existence of administrative resources unnecessarily"). Confirmed in
+`phase8-platform-admin.e2e-spec.ts` for `OWNER`/`MANAGER`/`STAFF`/an
+unrelated outsider, all denied identically.
+
+### Super Admin creation: bootstrap only, never a public endpoint
+
+There is no `POST /admin/register` and never will be (spec's explicit
+prohibition). The only way `platformRole` ever becomes `SUPER_ADMIN` is
+`promoteSuperAdminIfConfigured` (`src/bootstrap/super-admin.bootstrap
+.ts`), run once on every application boot: if `SUPER_ADMIN_EMAIL` is
+configured, the already-registered user with that email is promoted -
+idempotently (a re-run on an already-promoted user is a no-op) and
+non-destructively (it never creates a user, and does nothing if no
+matching user has registered yet). No password, secret, or credential is
+ever part of this mechanism - promotion only ever touches
+`platformRole`, nothing else about the account.
+
+### Organization management, and a genuinely new kind of suspension
+
+Platform-level suspension (`POST /admin/organizations/:id/suspend`) sets
+`Organization.status = SUSPENDED` directly. This is a **completely
+different fact** from Phase 7's `OrganizationSubscription.status =
+SUSPENDED` (spec is explicit these must never be conflated):
+
+```
+Organization.status = SUSPENDED            -- a Super Admin manually suspended this org
+OrganizationSubscription.status = SUSPENDED -- unpaid SaaS bill, grace period expired
+```
+
+Both can be true, either alone can be true, and setting one never touches
+the other - `suspendOrganization`/`activateOrganization` only ever write
+`Organization.status`, and `SubscriptionsService.evaluateLifecycle`
+(Phase 7) only ever writes `OrganizationSubscription.status`. **Platform
+suspension takes effect immediately and automatically, with no new
+wiring required**: `MembershipsService.assertOrganizationAccess` - the
+one chokepoint every Phase 2-7 organization-scoped endpoint already calls
+- has checked `organization.status === 'SUSPENDED'` since Phase 2. The
+moment a Super Admin suspends an organization, every `OWNER`/`MANAGER`/
+`STAFF` request against it starts failing with the pre-existing `403
+ORGANIZATION_SUSPENDED` - confirmed by suspending a real organization
+against the live database and watching its own owner's ordinary `GET
+/organizations/:id` call fail immediately. This is a direct, satisfying
+payoff of Phase 2's "one authorization chokepoint" decision: a feature
+four phases later needed zero new authorization plumbing to take effect
+platform-wide.
+
+### Owner/property/subscription visibility
+
+`GET /admin/owners`, `GET /admin/properties`, and `GET /admin/subscriptions`
+(plus each one's `:id` detail route) are read-only, database-aggregated
+views scoped to nothing - the platform-wide equivalent of
+`PropertiesService`/`ResidenciesService`, deliberately implemented as
+their own service (`PlatformAdminService`) rather than by bypassing an
+existing owner-scoped service's checks (spec: "Super Admin should not be
+implemented by simply bypassing all authorization checks inside existing
+owner services"). An owner managing multiple organizations, or an
+organization with multiple properties, is never flattened into a
+misleading 1:1 shape - `AdminOwnerResponseDto.organizations` is an array,
+and organization detail's `propertyCount` reflects every property under
+it.
+
+### SaaS plan management: admin mutation added, historical pricing still immutable
+
+Phase 7's `SaasPlansService` was deliberately read-only. Phase 8 adds
+`adminCreate`/`adminUpdate`/`adminDeactivate`, and the one rule that
+survives unmodified from Phase 7 is enforced more strongly, not less:
+`UpdateSaasPlanDto` has no `price`/`currency` field *at all* - not "the
+service ignores it if present," but "the global `ValidationPipe`'s
+`forbidNonWhitelisted` rejects the request outright with `400
+VALIDATION_FAILED` the moment a `PATCH` body includes `price`," proven in
+`phase8-platform-admin.e2e-spec.ts`. A price change is always
+`adminCreate` (a new row) plus `adminDeactivate` (retiring the old one) -
+exactly Phase 7's own "new plan version, never an in-place edit"
+convention, now with a real admin surface instead of "insert a row by
+hand."
+
+### Revenue: three separate figures, never combined
+
+Spec section "VERY IMPORTANT REVENUE DISTINCTION" is direct: SaaS revenue
+(the platform's own money) and tenant rent volume (money that passes
+through to owners) must never be combined into one number. This project
+already had the pieces because Phase 6/7 kept these domains separate
+from day one - Phase 8 only had to query each domain's own tables and
+label the results honestly:
+
+```
+SaaS Revenue Collected     SUM(SubscriptionPayment.amount WHERE status = 'CAPTURED')
+Tenant Rent Volume         SUM(Payment.amount WHERE status = 'CAPTURED')       -- NOT platform revenue
+Platform Fees Collected    SUM(Payment.platformFee WHERE status = 'CAPTURED') -- this part IS the platform's
+Owner Settlement Amount    SUM(Payment.ownerSettlementAmount WHERE status = 'CAPTURED')
+```
+
+`TenantPaymentMetricsDto`'s own doc comment states this explicitly, and
+every "collected" aggregate filters on `status: 'CAPTURED'` only (spec:
+never `DRAFT`, unpaid, failed, or cancelled) - `outstandingSaasInvoices`
+is a wholly separate query (`SUM(SubscriptionInvoice.total) WHERE status
+IN ('ISSUED', 'OVERDUE')`), never derived by subtracting from the
+collected figure.
+
+### Database-level aggregation, not Node-side reduction
+
+Every dashboard/analytics figure is `COUNT`/`SUM`/`GROUP BY` at the
+database layer - `PlatformAnalyticsService` never runs `findMany()` over
+an unbounded table and reduces it in JavaScript (spec's explicit
+performance requirement). Monthly revenue trend uses one parameterized
+`$queryRaw` with `date_trunc('month', "capturedAt")` (the one query shape
+Prisma's own query builder cannot express) - the only raw SQL in this
+service, and it takes no untrusted input to interpolate.
+
+### Audit logging
+
+`AuditLogService.record` is the only way an `AuditLog` row is ever
+created - there is no endpoint that accepts a client-submitted entry
+(spec: "the server creates them"). Organization suspend/activate and
+every SaaS plan mutation call it, capturing `actorUserId`/`action`/
+`entityType`/`entityId`/optional `organizationId`/`metadata`. `metadata`
+never contains a secret, password, token, or payment credential -
+only small, already-non-sensitive facts (e.g. a plan's new price, a
+previous status) that make the entry useful for reconstructing what
+happened, per the service's own doc comment.
+
+### A real concurrency bug, caught by the spec's own mandatory test
+
+`suspendOrganization`'s first implementation was "find the organization,
+check its status, then update it" - which looks identical to plenty of
+other checks in this codebase, but is not safe here, because nothing
+backs the transition with a database constraint the way Phase 4/5/6's
+partial/plain unique indexes do. Running spec's mandatory "Test 5:
+concurrent admin state change" for real - two simultaneous suspend calls
+for the same organization - showed **both calls succeeding**, which is
+wrong (and would have double-written the audit log for what should be
+one state change). The fix folds the expected prior status into
+`organization.updateMany`'s own `WHERE` clause
+(`{ id, status: { not: 'SUSPENDED' } }`), making the state transition
+itself the atomic, database-enforced unit - re-run after the fix,
+exactly one call succeeded and the other correctly received `409
+ORGANIZATION_ALREADY_SUSPENDED`. See "Testing strategy" above for the
+full before/after transcript and "Key decisions" for why this is a
+distinct concurrency pattern from every prior phase's (a conditional
+`updateMany`, not a unique index or a row lock).
+
+### Explicitly out of scope / known limitations
+
+- **No platform-admin UI** - this phase is API-only, per the project's
+  own "backend-only" scope (see the top of this README).
+- **No SaaS coupons/promotions or tax/GST engine** - unchanged from
+  Phase 7's own deferral.
+- **No full plan-versioning history table** - a plan's price history is
+  reconstructable from existing `SubscriptionInvoice` rows (each one
+  snapshots the price it was billed at) plus each `SaasPlan`'s own
+  `effectiveFrom`/`effectiveTo`, but there is no dedicated "plan version"
+  join table linking them explicitly.
+- **`SubscriptionAccessGuard` (Phase 7) remains unwired** - genuinely
+  different from Phase 8's organization-level suspension (see above,
+  which *is* fully wired via the pre-existing `MembershipsService`
+  chokepoint); Phase 7's subscription-suspension access policy is still
+  a standalone, unit-tested but unapplied guard, unchanged by this phase.
+- **No owner SaaS-subscription-suspension override for a Super Admin** -
+  a Super Admin can suspend/activate at the *organization* level, but
+  there is no admin action to manually force an `OrganizationSubscription`
+  out of `SUSPENDED`/`GRACE_PERIOD` (e.g. a goodwill extension) - only a
+  real payment moves that state machine.
 
 ## Roadmap
 
@@ -2239,6 +2539,9 @@ foundation → Phase 2 (done): organizations + properties +
 `OrganizationMembership`-based authorization → Phase 3 (done): rooms +
 beds → Phase 4 (done): tenants + residency + bed allocation → Phase 5
 (done): rent + invoices → Phase 6 (done): tenant payments + platform fee
-+ owner settlement (Razorpay) → Phase 7 (this repository, done): owner
-SaaS subscription (plans, recharge, renewal, grace period, suspension) →
-Phase 8: complaints → Phase 9: food/menu → Phase 10: notifications.
++ owner settlement (Razorpay) → Phase 7 (done): owner SaaS subscription
+(plans, recharge, renewal, grace period, suspension) → Phase 8 (this
+repository, done): Super Admin / founder platform management (global
+visibility, organization suspension, SaaS plan management, revenue
+analytics, audit logging) → Phase 9: complaints → Phase 10: food/menu →
+Phase 11: notifications.

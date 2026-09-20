@@ -12,6 +12,7 @@ import {
   jwtConfig,
   razorpayConfig,
   subscriptionConfig,
+  platformAdminConfig,
 } from './config/configuration';
 import { envValidationSchema } from './config/env.validation';
 import { PrismaModule } from './database/prisma.module';
@@ -33,6 +34,8 @@ import { SaasPlansModule } from './modules/saas-plans/saas-plans.module';
 import { SubscriptionsModule } from './modules/subscriptions/subscriptions.module';
 import { SubscriptionInvoicesModule } from './modules/subscription-invoices/subscription-invoices.module';
 import { SubscriptionPaymentsModule } from './modules/subscription-payments/subscription-payments.module';
+import { PlatformAdminModule } from './modules/platform-admin/platform-admin.module';
+import { PlatformAnalyticsModule } from './modules/platform-analytics/platform-analytics.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { RequestIdMiddleware } from './common/middleware/request-id.middleware';
@@ -45,7 +48,13 @@ import { HttpStatus } from '@nestjs/common';
     ConfigModule.forRoot({
       isGlobal: true,
       validationSchema: envValidationSchema,
-      load: [appConfig, jwtConfig, razorpayConfig, subscriptionConfig],
+      load: [
+        appConfig,
+        jwtConfig,
+        razorpayConfig,
+        subscriptionConfig,
+        platformAdminConfig,
+      ],
     }),
     ThrottlerModule.forRoot([
       {
@@ -75,6 +84,8 @@ import { HttpStatus } from '@nestjs/common';
     SubscriptionsModule,
     SubscriptionInvoicesModule,
     SubscriptionPaymentsModule,
+    PlatformAdminModule,
+    PlatformAnalyticsModule,
   ],
   providers: [
     {
