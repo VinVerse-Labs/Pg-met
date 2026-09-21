@@ -3663,6 +3663,267 @@ query confirmed zero leftover rows.
   until real provider credentials (FCM/APNs, SendGrid, Twilio, WhatsApp
   Business API) are integrated.
 
+## Phase 12 — Tenant Discovery, Applications & Visits
+
+### Architecture: the acquisition funnel, strictly upstream of Phase 4
+
+Phase 4 built the OPERATIONAL tenancy layer: `Tenant -> Residency ->
+BedAllocation`, all of it presupposing someone has already decided to
+move in. Phase 12 builds the ACQUISITION funnel that happens *before*
+that decision exists at all:
+
+```
+PropertyListing (public discovery)
+  -> TenantApplication (an applicant's interest in one property)
+  -> PropertyVisit (optional site visit)
+  -> approval (a decision, nothing more)
+  -> (manual, explicit) onboarding -> tenantId
+  -> [Phase 4] POST /residencies (unchanged, called by the owner/manager)
+```
+
+The boundary is deliberate and enforced in code, not just documentation:
+`ApplicationLifecycleService.approve` only ever flips
+`TenantApplication.status` to `APPROVED` - it has no dependency on
+`ResidenciesService` and touches no Residency/BedAllocation/Invoice/
+Payment table. `ApplicationConversionService.startOnboarding` is a new,
+separate, explicit endpoint that hands back a `tenantId` and stops there.
+The actual move-in remains exactly what it already was: a manual call to
+the existing `POST /residencies` endpoint. This is proven by an e2e test
+that asserts `residency.count() === 0`, `bedAllocation.count() === 0`,
+`invoice.count() === 0`, and `payment.count() === 0` immediately after an
+approval.
+
+### Property listing model
+
+`PropertyListing` (`prisma/schema.prisma`) is a **separate** table from
+`Property`, one-per-property (`@@unique` on `propertyId`), holding only
+marketing fields Property itself has no business owning: `title`,
+`description`, `locality` (Property has `city` but no finer-grained
+locality), `latitude`/`longitude`, `coverImageUrl`, `contactEnabled`, and
+`startingFromPrice`. `Amenity` is a plain enum joined through
+`PropertyListingAmenity` (`@@unique([propertyListingId, amenity])`) - a
+normalized join table rather than a comma-string column or a wide table
+of booleans.
+
+**Pricing note**: Phase 5 confirmed `RentPlan` is per-residency
+(tenant-specific, only exists once someone has actually moved in) - there
+is no tenant-agnostic "the rent for this property" to read publicly.
+`startingFromPrice` is therefore a manually-maintained, indicative-only
+`Decimal` the owner sets themselves on the listing - never derived from
+any RentPlan, and never treated as a quote or binding price anywhere in
+this module.
+
+Lifecycle: `DRAFT -> PUBLISHED` (`POST /properties/:id/listing/publish`,
+400 `LISTING_INCOMPLETE` unless title/description/city/locality are all
+present) `-> UNPUBLISHED` (reversible). Only `PUBLISHED` listings, on a
+Property that is `ACTIVE`, in an Organization that is not `SUSPENDED`,
+are ever visible through `/public/*` - filtered at the query level in
+`PublicDiscoveryService`, never left to the absence of a guard alone.
+
+### The `@Public()` pattern - actually just "no guard"
+
+This codebase had no genuinely public (unauthenticated) endpoint before
+Phase 12. Investigating `JwtAuthGuard`/`AppModule` first showed the
+answer was simpler than a global public/private toggle: **no controller
+in this codebase applies `JwtAuthGuard` via `APP_GUARD`** - every
+controller opts in with its own `@UseGuards(JwtAuthGuard)`. So
+`PublicPropertiesController` (`/public/properties/**`) simply **omits**
+that decorator; the route path is the security boundary, and every
+service method underneath it re-filters at the query level
+(`PublicDiscoveryService`'s `publicListingWhere()`/`assertApplicable`)
+rather than trusting the missing guard alone.
+
+The one endpoint that needs to *optionally* recognize a caller -
+`POST /public/properties/:propertyId/applications`, which auto-links
+`applicantUserId` for an authenticated submitter but must also accept a
+guest - uses a new `OptionalJwtAuthGuard`
+(`src/modules/tenant-discovery/guards/optional-jwt-auth.guard.ts`): a
+one-method override of Passport's `AuthGuard('jwt')` whose
+`handleRequest` returns `user || undefined` instead of throwing on a
+missing/invalid token. No `SetMetadata('isPublic')`/`Reflector` toggle was
+needed - the simplest approach consistent with this codebase's existing
+per-controller guard convention.
+
+### Application lifecycle
+
+`TenantApplication.status`: `SUBMITTED -> UNDER_REVIEW -> (APPROVED |
+REJECTED)`, plus `WITHDRAWN` (applicant only, from `SUBMITTED`/
+`UNDER_REVIEW`/`VISIT_SCHEDULED`) and `EXPIRED` (bulk, see below). No
+`DRAFT` state - there is no save-and-resume UX in this phase, so
+`SUBMITTED` is the initial state.
+
+- **Duplicate prevention**: a hand-written partial unique index
+  (`tenant_applications_active_applicant_property_unique`, the same
+  pattern `residencies_active_tenant_unique`/
+  `bed_allocations_active_bed_unique` already established for a
+  conditional-uniqueness rule Prisma's schema DSL cannot express) keyed
+  on `(propertyId, COALESCE(applicantUserId::text, phone))` where status
+  is not in `(REJECTED, WITHDRAWN, EXPIRED)` - covering both authenticated
+  and guest applicants with one identity key. The resulting P2002 is
+  caught and translated to a generic `APPLICATION_ALREADY_EXISTS` -
+  the response never echoes back the phone/email that collided.
+- **`internalReviewNotes`** exists on the model for the owner's own
+  deliberations but has **no getter anywhere in `ApplicationResponseDto`**
+  - it is structurally impossible for any applicant-facing or public
+  response to include it.
+- **Approval never implies a reserved bed** - the `APPLICATION_APPROVED`
+  notification body says so explicitly ("the owner will reach out to
+  complete your move-in"), and the code backs that claim (see the
+  acquisition-funnel boundary above).
+- **`expireStaleApplications()`** (`ApplicationLifecycleService`) is a
+  plain, callable bulk `updateMany` (30-day cutoff) with **no scheduler
+  wired to it** - this project has no cron/job infrastructure yet (same
+  as `InvoicesService.evaluateStatus`'s lazy-on-read `OVERDUE` and
+  `SubscriptionsService`'s `evaluateLifecycle`), and the spec was explicit
+  not to add one (e.g. `node-cron`) just for this. Automated scheduling is
+  deferred to a future phase's scheduler infrastructure.
+
+### Visit lifecycle
+
+`PropertyVisit.status`: `REQUESTED` (applicant-initiated, no time yet)
+`-> SCHEDULED` (owner/manager sets a time, via either a direct
+`POST /applications/:id/visits` create-as-SCHEDULED or a
+`POST /visits/:id/confirm` on an existing REQUESTED row) `-> COMPLETED |
+CANCELLED | NO_SHOW`. Reschedule (`POST /visits/:id/reschedule`) updates
+the *same row's* times - it never creates a new one, so the id an
+applicant is tracking never changes underneath them.
+
+**Conflict detection**: no two `SCHEDULED` visits may overlap on the same
+property. `PropertyVisitsService.assertNoConflict` runs inside a
+transaction guarded by `pg_advisory_xact_lock(hashtext(propertyId))` -
+this is what actually closes the SELECT-then-write race window a plain
+application-level check would leave open; a plain overlap query alone
+(without the lock) would let two concurrent requests for the exact same
+window both pass their own read before either commits. Verified against
+real Postgres: two concurrent overlapping schedule requests for the same
+property resolve to exactly one `SCHEDULED` row and one
+`VISIT_TIME_CONFLICT`, while a genuinely non-overlapping request
+afterward still succeeds cleanly.
+
+### Application-to-tenant conversion
+
+A **new, explicit, separate** step -
+`POST /applications/:id/start-onboarding` - never automatic on approval.
+`ApplicationConversionService.startOnboarding`:
+
+1. Requires `status === APPROVED` (400 `APPLICATION_INVALID_STATE`
+   otherwise).
+2. If the applicant has no linked User (a guest applicant), it creates
+   one via the existing phone-only account path
+   (`UsersService.create`/`AuthService.register` already accept "either
+   email or phone" - no new auth flow was invented for this).
+3. Reuses an existing `Tenant` row if `Tenant.userId ===
+   application.applicantUserId` already exists - `prisma.tenant.upsert`
+   on the unique `userId` column, never a duplicate create.
+4. Returns `{ tenantId, applicationId, reused }` and stops - it never
+   calls `ResidenciesService.checkIn` and never creates a BedAllocation.
+
+**Concurrency**: the entire claim-and-convert sequence runs inside a
+transaction opened with `pg_advisory_xact_lock(hashtext(applicationId))`.
+An earlier version of this service used only a conditional `updateMany`
+on `onboardingStartedAt IS NULL` (the pattern every other lifecycle
+transition in this codebase uses) - under real concurrent load, that left
+a window where the *losing* caller could observe "already claimed" before
+the winner had actually finished creating the Tenant row, and would
+answer with a transient `APPLICATION_ALREADY_CONVERTED` instead of the
+real `tenantId`. The advisory lock instead makes the loser's transaction
+*wait* for the winner's to fully commit, so it always resolves to the
+same completed `tenantId` - verified against real Postgres: two
+concurrent `startOnboarding` calls on the same approved application both
+resolve successfully, to the exact same `tenantId`, and exactly one
+`Tenant` row exists afterward.
+
+### Notification integrations (Phase 11 reuse, not a new system)
+
+Eight new `NotificationType` values (`APPLICATION_SUBMITTED`,
+`APPLICATION_REVIEW_STARTED`, `APPLICATION_APPROVED`,
+`APPLICATION_REJECTED`, `VISIT_SCHEDULED`, `VISIT_RESCHEDULED`,
+`VISIT_CANCELLED`, `VISIT_NO_SHOW`) added to the same plain `const`
+object every prior phase's types live in, with matching `TEMPLATES`
+entries and entity-ID-only payload types
+(`ApplicationEventPayload`/`VisitEventPayload`). `TenantApplicationsService`/
+`ApplicationLifecycleService`/`PropertyVisitsService` only ever call
+`DomainEventBusService.emit(...)` after their own transaction has
+committed - exactly like every business module before them, never
+importing `NotificationsModule` directly. All eight handlers live in
+`NotificationEventService`, following the same "re-read the entity fresh
+from Postgres, never trust the payload beyond an id" discipline as every
+handler before them. `APPLICATION_REJECTED`'s template only ever
+interpolates `rejectionReason` (the public-safe field) - it never reads
+`internalReviewNotes`.
+
+### Authorization matrix
+
+| Actor | Public discovery | Submit application | Own applications/visits | Org applications/visits (GET) | Org applications/visits (mutate) | `/admin/*` |
+|---|---|---|---|---|---|---|
+| Guest (unauthenticated) | yes | yes | - | - | - | - |
+| Applicant (authenticated) | yes | yes (auto-linked) | yes, BOLA-scoped | - | - | - |
+| STAFF | yes | yes | - | yes | **no** (404, not 403 - same convention as `ComplaintsService.getOrgComplaintForActionOrThrow`) | - |
+| MANAGER / OWNER | yes | yes | - | yes | yes | - |
+| SUPER_ADMIN | yes | yes | - | yes (unconditional bypass) | yes (unconditional bypass) | yes, read-only |
+
+Cross-organization/cross-property/cross-applicant access resolves to 404,
+never 403 - the existence of another organization's application or
+another applicant's visit is never confirmed to an unrelated caller, the
+same "hide resource existence" convention `MembershipsService`/
+`ComplaintsService`/`PlatformAdminGuard` already use throughout this
+codebase.
+
+### Testing
+
+Unit tests (`src/modules/tenant-discovery/services/**/*.spec.ts`, the
+same plain-construction-with-mocked-dependencies style as
+`complaint-lifecycle.service.spec.ts`) cover listing publish validation,
+application create/duplicate-prevention/normalization, the full review/
+approve/reject/withdraw/expire lifecycle including lost-race handling,
+visit request/schedule/reschedule/complete/cancel/no-show and time-conflict
+detection, and conversion's existing-tenant-reuse/new-tenant-creation/
+lost-race paths. `test/phase12-tenant-discovery.e2e-spec.ts` follows the
+same per-suite `FakePrisma` pattern as every prior phase's e2e file and
+drives the full HTTP surface: public discovery (published-only), guest and
+authenticated application submission, the mandatory approval financial-
+isolation assertion, rejection with safe-reason visibility, withdrawal,
+the full request -> schedule -> reschedule -> complete visit history,
+cancellation, cross-organization/cross-applicant isolation, STAFF
+read-only enforcement (404 on mutation attempts), notification
+integration (no duplicate on a repeated approve, and an explicit test
+proving a simulated notification-publish failure never rolls back the
+approval), and Super Admin read-only `/admin/*` access.
+
+A one-off `scripts/verify-phase12-tenant-discovery.ts` (run via
+`NestFactory.createApplicationContext(AppModule)`, then deleted per this
+project's standing convention) confirmed against the real Postgres
+container: (1) two concurrent approvals of the same application resolve
+to exactly one success and one controlled conflict, final state
+`APPROVED`; (2) two concurrent duplicate application submissions resolve
+to exactly one created row; (3) two concurrent overlapping visit-schedule
+requests resolve to exactly one `SCHEDULED` visit, while a genuinely
+non-overlapping follow-up request still succeeds; (4) two concurrent
+`startOnboarding` calls on the same approved application both resolve to
+the same `tenantId`, with exactly one `Tenant` row created. All seeded
+rows (tagged with a per-run id) were deleted at the end of the run.
+
+### Known limitations
+
+- **No cron-based auto-expiration** - `expireStaleApplications()` exists
+  and is fully tested but nothing calls it on a schedule; deferred to a
+  future scheduler-infrastructure phase (same status as `RENT_INVOICE_OVERDUE`-
+  style lazy evaluation elsewhere in this codebase).
+- **No file-upload/media system** - `coverImageUrl` and any other image
+  field are URL-reference-only; this phase does not add object storage or
+  an upload endpoint.
+- **No application fees, no marketplace/commission model, no in-app chat
+  between applicant and owner, no reviews/ratings** - all explicitly out
+  of scope per the spec; `contactEnabled` only toggles whether contact
+  details are shown, it does not gate a chat feature that does not exist.
+- **Room-type availability aggregation** (`GET /public/properties/:id`'s
+  `roomTypeAvailability`) is proven correct against real Postgres via
+  direct SQL inspection during this phase's verification pass, but the
+  e2e suite's `FakePrisma.$queryRaw` is stubbed to return `[]` (matching
+  the same simplification `phase11-notifications.e2e-spec.ts` already
+  makes for its own `$queryRaw` stub) rather than re-implementing full SQL
+  aggregation in-memory.
+
 ## Roadmap
 
 Phase 0 (done) → Phase 1 (done): platform identity, auth, sessions, KYC
@@ -3683,4 +3944,12 @@ dashboard, isolated food billing, meal consumption) → Phase 11 (this
 repository, done): notifications & communication infrastructure (an
 in-process domain event bus, ~20 business-event integrations, in-app +
 stubbed push/email/WhatsApp/SMS channels, per-user preferences, push-device
-registration, idempotent delivery, Super Admin aggregate-only visibility).
+registration, idempotent delivery, Super Admin aggregate-only visibility)
+→ Phase 12 (this repository, done): tenant discovery, applications &
+visits (public property listings, guest/authenticated application
+submission with a partial-unique duplicate guard, application review/
+approve/reject/withdraw lifecycle, advisory-lock-guarded visit scheduling
+with conflict detection, an explicit and separate application-to-tenant
+conversion step that never auto-creates a Residency, eight new
+notification integrations, and the codebase's first genuinely public,
+unguarded HTTP surface).

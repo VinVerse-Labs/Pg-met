@@ -530,6 +530,12 @@ model User {
   notificationPreferences NotificationPreference[]
   pushDevices             PushDevice[]
 
+  applicationsSubmitted   ApplicationActivity[]
+  applicationsAsApplicant TenantApplication[]   @relation("ApplicationApplicant")
+  applicationsReviewed    TenantApplication[]   @relation("ApplicationReviewer")
+  visitsAsApplicant       PropertyVisit[]       @relation("VisitApplicant")
+  visitsCreated           PropertyVisit[]       @relation("VisitCreatedBy")
+
   @@map("users")
 }
 
@@ -635,6 +641,10 @@ model Organization {
   mealConsumptions         MealConsumption[]
   notifications            Notification[]
 
+  propertyListings   PropertyListing[]
+  tenantApplications TenantApplication[]
+  propertyVisits     PropertyVisit[]
+
   @@map("organizations")
 }
 
@@ -691,6 +701,10 @@ model Property {
   residencies Residency[]
   payments    Payment[]
   complaints  Complaint[]
+
+  listing      PropertyListing?
+  applications TenantApplication[]
+  visits       PropertyVisit[]
 
   foodConfiguration        FoodConfiguration?
   foodPlans                FoodPlan[]
@@ -2212,4 +2226,259 @@ model PushDevice {
   @@index([userId])
   @@index([userId, isActive])
   @@map("push_devices")
+}
+
+// ---------------------------------------------------------------------------
+// Tenant discovery, applications & visits (Phase 12)
+//
+// The tenant ACQUISITION funnel, sitting strictly upstream of Phase 4's
+// OPERATIONAL tenancy layer (Tenant -> Residency -> BedAllocation):
+//   PropertyListing (public discovery) -> TenantApplication (an applicant's
+//   interest) -> PropertyVisit (an optional site visit) -> approval ->
+//   (manual, separate) onboarding via the existing Tenant/Residency APIs.
+// This phase never creates a Residency/BedAllocation/Invoice/Payment - see
+// README's "Phase 12" section and ApplicationConversionService's own doc
+// comment for the exact boundary.
+// ---------------------------------------------------------------------------
+
+enum ListingStatus {
+  DRAFT
+  PUBLISHED
+  UNPUBLISHED
+}
+
+// Kept small and generic on purpose - the same "escape hatch, not a
+// combinatorial explosion of booleans" reasoning as RoomType/
+// ComplaintCategory elsewhere in this schema.
+enum Amenity {
+  WIFI
+  LAUNDRY
+  PARKING
+  AC
+  POWER_BACKUP
+  HOUSEKEEPING
+  SECURITY
+  CCTV
+  FOOD
+  GYM
+  COMMON_AREA
+}
+
+// No DRAFT here - unlike TenantApplication's owner-facing counterpart
+// (ListingStatus.DRAFT), there is no save-and-resume application UX in
+// this phase, so SUBMITTED is the initial state. EXPIRED is a lazily/
+// batch-applied terminal state - see
+// TenantApplicationsService.expireStaleApplications (no cron infra exists
+// yet, spec: do not add a scheduler dependency for this).
+enum ApplicationStatus {
+  SUBMITTED
+  UNDER_REVIEW
+  VISIT_SCHEDULED
+  APPROVED
+  REJECTED
+  WITHDRAWN
+  EXPIRED
+}
+
+enum VisitStatus {
+  REQUESTED
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+// The public-facing discovery representation of a Property - deliberately
+// not a duplicate of Property itself (name/address/type stay on Property;
+// this table only ever adds *marketing* fields: title/description/
+// locality/coverImageUrl/amenities/indicative price). One listing per
+// property (`@@unique` on `propertyId`) - a property is either not listed,
+// or has exactly one (draft/published/unpublished) listing, never several
+// competing ones.
+//
+// `startingFromPrice` is deliberately NOT derived from RentPlan - Phase 5
+// confirmed rent plans are per-residency (tenant-specific, only exist once
+// someone has actually moved in), so there is no tenant-agnostic "rent
+// rate" to read publicly. This field is a manually-maintained, indicative-
+// only figure the owner sets themselves - never treated as a quote or
+// binding price anywhere in this module.
+model PropertyListing {
+  id             String        @id @default(uuid())
+  organizationId String
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId     String        @unique
+  property       Property      @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  status         ListingStatus @default(DRAFT)
+
+  title             String?
+  description       String?
+  // Denormalized from Property.city at publish time for query performance
+  // (a public discovery search filters by city/locality far more often
+  // than it changes) - PropertiesService/PropertyListingsService keep it
+  // in sync whenever the listing is created/updated.
+  city              String?
+  locality          String?
+  latitude          Float?
+  longitude         Float?
+  coverImageUrl     String?
+  contactEnabled    Boolean  @default(true)
+  startingFromPrice Decimal? @db.Decimal(12, 2)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  publishedAt DateTime?
+
+  amenities    PropertyListingAmenity[]
+  applications TenantApplication[]
+
+  @@index([organizationId])
+  @@index([status])
+  @@index([city])
+  @@index([locality])
+  @@map("property_listings")
+}
+
+// A simple normalized join table rather than a comma-joined string column
+// or a wide table of boolean columns (spec: "prefer a normalized-but-
+// simple model over overengineering") - `@@unique` prevents the same
+// amenity being recorded twice for one listing.
+model PropertyListingAmenity {
+  id                String          @id @default(uuid())
+  propertyListingId String
+  propertyListing   PropertyListing @relation(fields: [propertyListingId], references: [id], onDelete: Cascade)
+  amenity           Amenity
+
+  createdAt DateTime @default(now())
+
+  @@unique([propertyListingId, amenity])
+  @@index([propertyListingId])
+  @@map("property_listing_amenities")
+}
+
+// An applicant's expression of interest in a property, prior to becoming a
+// Tenant (Phase 4). `applicantUserId` is nullable - a guest/public
+// applicant has no User yet; if the request was authenticated,
+// TenantApplicationsService auto-links it. `internalReviewNotes` is never
+// exposed to the applicant or in any public response DTO -
+// `rejectionReason` is the only owner-authored text an applicant may see.
+//
+// Duplicate-prevention: a partial unique index (added by hand in this
+// phase's migration SQL, the same pattern Residency/BedAllocation already
+// use for a conditional uniqueness rule Prisma's schema DSL cannot
+// express) prevents more than one *active* (status not in REJECTED/
+// WITHDRAWN/EXPIRED) application for the same (property, applicant)
+// pair - keyed by applicantUserId when present, else normalized phone, so
+// both authenticated and guest applicants are covered:
+//   CREATE UNIQUE INDEX tenant_applications_active_applicant_property_unique
+//     ON tenant_applications (property_id, COALESCE(applicant_user_id::text, phone))
+//     WHERE status NOT IN ('REJECTED', 'WITHDRAWN', 'EXPIRED');
+model TenantApplication {
+  id                String           @id @default(uuid())
+  organizationId    String
+  organization      Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId        String
+  property          Property         @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  propertyListingId String?
+  propertyListing   PropertyListing? @relation(fields: [propertyListingId], references: [id], onDelete: SetNull)
+  applicantUserId   String?
+  applicantUser     User?            @relation("ApplicationApplicant", fields: [applicantUserId], references: [id], onDelete: SetNull)
+
+  fullName              String
+  phone                 String
+  email                 String?
+  status                ApplicationStatus @default(SUBMITTED)
+  preferredMoveInDate   DateTime?
+  preferredRoomType     RoomType?
+  preferredStayDuration Int?
+  notes                 String?
+  rejectionReason       String?
+  internalReviewNotes   String?
+
+  reviewedByUserId String?
+  reviewedByUser   User?     @relation("ApplicationReviewer", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+  reviewedAt       DateTime?
+  decisionAt       DateTime?
+
+  // Concurrency guard for ApplicationConversionService.startOnboarding -
+  // set via a conditional updateMany so two concurrent onboarding calls
+  // for the same application can never both "win" and create two Tenants.
+  onboardingStartedAt DateTime?
+
+  submittedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  activities ApplicationActivity[]
+  visits     PropertyVisit[]
+
+  @@index([organizationId])
+  @@index([propertyId])
+  @@index([applicantUserId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([preferredMoveInDate])
+  @@map("tenant_applications")
+}
+
+// A permanent, append-only business-history record of what happened to an
+// application - deliberately separate from AuditLog (Phase 8's platform-
+// admin audit trail, a different reader with a different purpose), even
+// though some of the same events are written to both (see
+// TenantApplicationsService/ApplicationLifecycleService for which ones).
+model ApplicationActivity {
+  id            String            @id @default(uuid())
+  applicationId String
+  application   TenantApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  actorUserId   String?
+  actorUser     User?             @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  action        String
+  metadata      Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([applicationId])
+  @@map("application_activities")
+}
+
+// A site visit tied to exactly one TenantApplication. `scheduledStartAt`/
+// `scheduledEndAt` are both nullable - a REQUESTED visit (applicant-
+// initiated, no time chosen yet) has neither; they are set when an
+// OWNER/MANAGER moves the visit to SCHEDULED. Conflict detection (no two
+// SCHEDULED visits at the same property with overlapping time ranges) is
+// enforced in PropertyVisitsService, inside a transaction using a
+// Postgres advisory lock keyed by propertyId (`pg_advisory_xact_lock`) to
+// close the SELECT-then-write race window under real concurrency - see
+// PropertyVisitsService.assertNoConflict for the exact mechanism, mirroring
+// the level of rigor BedAllocation's partial-unique-index +
+// transaction combination already established for a different kind of
+// conflict.
+model PropertyVisit {
+  id              String            @id @default(uuid())
+  organizationId  String
+  organization    Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId      String
+  property        Property          @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  applicationId   String
+  application     TenantApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  applicantUserId String?
+  applicantUser   User?             @relation("VisitApplicant", fields: [applicantUserId], references: [id], onDelete: SetNull)
+
+  scheduledStartAt DateTime?
+  scheduledEndAt   DateTime?
+  status           VisitStatus @default(REQUESTED)
+  notes            String?
+  cancelReason     String?
+
+  createdByUserId String
+  createdByUser   User   @relation("VisitCreatedBy", fields: [createdByUserId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId])
+  @@index([propertyId])
+  @@index([applicationId])
+  @@index([scheduledStartAt])
+  @@index([status])
+  @@map("property_visits")
 }

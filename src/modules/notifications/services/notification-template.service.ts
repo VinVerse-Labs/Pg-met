@@ -125,6 +125,40 @@ const TEMPLATES: Record<NotificationType, TemplateDefinition> = {
     title: '{{title}}',
     body: '{{body}}',
   },
+  APPLICATION_SUBMITTED: {
+    title: 'New application received',
+    body: '{{applicantName}} applied to {{propertyName}}.',
+  },
+  APPLICATION_REVIEW_STARTED: {
+    title: 'Your application is under review',
+    body: 'Your application to {{propertyName}} is now under review.',
+  },
+  // Deliberately never implies a bed/room is reserved (spec) - approval
+  // only means the applicant may proceed to manual onboarding.
+  APPLICATION_APPROVED: {
+    title: 'Application approved',
+    body: 'Your application to {{propertyName}} has been approved. The owner will reach out to complete your move-in.',
+  },
+  APPLICATION_REJECTED: {
+    title: 'Application update',
+    body: 'Your application to {{propertyName}} was not approved.{{reasonSuffix}}',
+  },
+  VISIT_SCHEDULED: {
+    title: 'Visit scheduled',
+    body: 'Your visit to {{propertyName}} is scheduled for {{scheduledAt}}.',
+  },
+  VISIT_RESCHEDULED: {
+    title: 'Visit rescheduled',
+    body: 'Your visit to {{propertyName}} has been rescheduled to {{scheduledAt}}.',
+  },
+  VISIT_CANCELLED: {
+    title: 'Visit cancelled',
+    body: 'Your visit to {{propertyName}} has been cancelled.',
+  },
+  VISIT_NO_SHOW: {
+    title: 'Visit missed',
+    body: 'The scheduled visit to {{propertyName}} was marked as a no-show.',
+  },
 };
 
 @Injectable()

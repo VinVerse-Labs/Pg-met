@@ -41,3 +41,13 @@ export interface SaasSubscriptionPaymentEventPayload {
 export interface SaasSubscriptionEventPayload {
   organizationId: string;
 }
+
+// Phase 12 - tenant discovery, applications & visits. Same "id only"
+// discipline as every payload above.
+export interface ApplicationEventPayload {
+  applicationId: string;
+}
+
+export interface VisitEventPayload {
+  visitId: string;
+}

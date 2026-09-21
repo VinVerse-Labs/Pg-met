@@ -5,6 +5,7 @@ import { NotificationsService } from './notifications.service';
 import { NotificationRecipientsService } from './notification-recipients.service';
 import { NotificationType } from '../enums/notification-type.enum';
 import {
+  ApplicationEventPayload,
   ComplaintEventPayload,
   FoodMenuEventPayload,
   FoodSubscriptionEventPayload,
@@ -14,6 +15,7 @@ import {
   ResidencyEventPayload,
   SaasSubscriptionEventPayload,
   SaasSubscriptionPaymentEventPayload,
+  VisitEventPayload,
 } from '../types/notification-event.types';
 
 // The single subscriber for every business event this phase supports
@@ -164,7 +166,199 @@ export class NotificationEventService implements OnModuleInit {
         ),
     );
 
+    this.eventBus.on<ApplicationEventPayload>(
+      NotificationType.APPLICATION_SUBMITTED,
+      (p) => this.onApplicationSubmitted(p),
+    );
+    this.eventBus.on<ApplicationEventPayload>(
+      NotificationType.APPLICATION_REVIEW_STARTED,
+      (p) => this.onApplicationReviewStarted(p),
+    );
+    this.eventBus.on<ApplicationEventPayload>(
+      NotificationType.APPLICATION_APPROVED,
+      (p) => this.onApplicationApproved(p),
+    );
+    this.eventBus.on<ApplicationEventPayload>(
+      NotificationType.APPLICATION_REJECTED,
+      (p) => this.onApplicationRejected(p),
+    );
+    this.eventBus.on<VisitEventPayload>(NotificationType.VISIT_SCHEDULED, (p) =>
+      this.onVisitState(p, NotificationType.VISIT_SCHEDULED),
+    );
+    this.eventBus.on<VisitEventPayload>(
+      NotificationType.VISIT_RESCHEDULED,
+      (p) => this.onVisitState(p, NotificationType.VISIT_RESCHEDULED),
+    );
+    this.eventBus.on<VisitEventPayload>(NotificationType.VISIT_CANCELLED, (p) =>
+      this.onVisitState(p, NotificationType.VISIT_CANCELLED),
+    );
+    this.eventBus.on<VisitEventPayload>(NotificationType.VISIT_NO_SHOW, (p) =>
+      this.onVisitNoShow(p),
+    );
+
     this.logger.log('NOTIFICATION_EVENT_HANDLERS_REGISTERED');
+  }
+
+  // ---------------------------------------------------------------------
+  // Tenant discovery, applications & visits (Phase 12)
+  // ---------------------------------------------------------------------
+
+  private async onApplicationSubmitted(
+    p: ApplicationEventPayload,
+  ): Promise<void> {
+    const application = await this.prisma.tenantApplication.findUnique({
+      where: { id: p.applicationId },
+      include: { property: true },
+    });
+    if (!application) return;
+    const staffUserIds = await this.recipients.activeOrgMembersByRole(
+      application.organizationId,
+      ['OWNER', 'MANAGER'],
+    );
+    for (const userId of staffUserIds) {
+      await this.notifications.publish({
+        userId,
+        type: NotificationType.APPLICATION_SUBMITTED,
+        idempotencyKey: `${NotificationType.APPLICATION_SUBMITTED}:${application.id}:${userId}`,
+        organizationId: application.organizationId,
+        propertyId: application.propertyId,
+        templateVars: {
+          applicantName: application.fullName,
+          propertyName: application.property.name,
+        },
+        data: { screen: 'APPLICATION', applicationId: application.id },
+      });
+    }
+  }
+
+  private async onApplicationReviewStarted(
+    p: ApplicationEventPayload,
+  ): Promise<void> {
+    const application = await this.prisma.tenantApplication.findUnique({
+      where: { id: p.applicationId },
+      include: { property: true },
+    });
+    if (!application?.applicantUserId) return;
+    await this.notifications.publish({
+      userId: application.applicantUserId,
+      type: NotificationType.APPLICATION_REVIEW_STARTED,
+      idempotencyKey: `${NotificationType.APPLICATION_REVIEW_STARTED}:${application.id}`,
+      organizationId: application.organizationId,
+      propertyId: application.propertyId,
+      templateVars: { propertyName: application.property.name },
+      data: { screen: 'APPLICATION', applicationId: application.id },
+    });
+  }
+
+  private async onApplicationApproved(
+    p: ApplicationEventPayload,
+  ): Promise<void> {
+    const application = await this.prisma.tenantApplication.findUnique({
+      where: { id: p.applicationId },
+      include: { property: true },
+    });
+    if (!application?.applicantUserId || application.status !== 'APPROVED')
+      return;
+    await this.notifications.publish({
+      userId: application.applicantUserId,
+      type: NotificationType.APPLICATION_APPROVED,
+      idempotencyKey: `${NotificationType.APPLICATION_APPROVED}:${application.id}`,
+      organizationId: application.organizationId,
+      propertyId: application.propertyId,
+      templateVars: { propertyName: application.property.name },
+      data: { screen: 'APPLICATION', applicationId: application.id },
+    });
+  }
+
+  private async onApplicationRejected(
+    p: ApplicationEventPayload,
+  ): Promise<void> {
+    const application = await this.prisma.tenantApplication.findUnique({
+      where: { id: p.applicationId },
+      include: { property: true },
+    });
+    if (!application?.applicantUserId || application.status !== 'REJECTED')
+      return;
+    await this.notifications.publish({
+      userId: application.applicantUserId,
+      type: NotificationType.APPLICATION_REJECTED,
+      idempotencyKey: `${NotificationType.APPLICATION_REJECTED}:${application.id}`,
+      organizationId: application.organizationId,
+      propertyId: application.propertyId,
+      templateVars: {
+        propertyName: application.property.name,
+        // Only the public-safe rejectionReason - internalReviewNotes is
+        // never read here (spec: never leak it to the applicant).
+        reasonSuffix: application.rejectionReason
+          ? ` Reason: ${application.rejectionReason}`
+          : '',
+      },
+      data: { screen: 'APPLICATION', applicationId: application.id },
+    });
+  }
+
+  private async onVisitState(
+    p: VisitEventPayload,
+    type:
+      | typeof NotificationType.VISIT_SCHEDULED
+      | typeof NotificationType.VISIT_RESCHEDULED
+      | typeof NotificationType.VISIT_CANCELLED,
+  ): Promise<void> {
+    const visit = await this.prisma.propertyVisit.findUnique({
+      where: { id: p.visitId },
+      include: { property: true },
+    });
+    if (!visit?.applicantUserId) return;
+    await this.notifications.publish({
+      userId: visit.applicantUserId,
+      type,
+      idempotencyKey: `${type}:${visit.id}:${visit.updatedAt.getTime()}`,
+      organizationId: visit.organizationId,
+      propertyId: visit.propertyId,
+      templateVars: {
+        propertyName: visit.property.name,
+        scheduledAt: visit.scheduledStartAt
+          ? visit.scheduledStartAt.toISOString()
+          : '',
+      },
+      data: { screen: 'VISIT', visitId: visit.id },
+    });
+  }
+
+  // No-show also notifies the OWNER/MANAGER side (spec), in addition to
+  // the applicant.
+  private async onVisitNoShow(p: VisitEventPayload): Promise<void> {
+    const visit = await this.prisma.propertyVisit.findUnique({
+      where: { id: p.visitId },
+      include: { property: true },
+    });
+    if (!visit) return;
+    if (visit.applicantUserId) {
+      await this.notifications.publish({
+        userId: visit.applicantUserId,
+        type: NotificationType.VISIT_NO_SHOW,
+        idempotencyKey: `${NotificationType.VISIT_NO_SHOW}:${visit.id}:applicant`,
+        organizationId: visit.organizationId,
+        propertyId: visit.propertyId,
+        templateVars: { propertyName: visit.property.name },
+        data: { screen: 'VISIT', visitId: visit.id },
+      });
+    }
+    const staffUserIds = await this.recipients.activeOrgMembersByRole(
+      visit.organizationId,
+      ['OWNER', 'MANAGER'],
+    );
+    for (const userId of staffUserIds) {
+      await this.notifications.publish({
+        userId,
+        type: NotificationType.VISIT_NO_SHOW,
+        idempotencyKey: `${NotificationType.VISIT_NO_SHOW}:${visit.id}:${userId}`,
+        organizationId: visit.organizationId,
+        propertyId: visit.propertyId,
+        templateVars: { propertyName: visit.property.name },
+        data: { screen: 'VISIT', visitId: visit.id },
+      });
+    }
   }
 
   // ---------------------------------------------------------------------
