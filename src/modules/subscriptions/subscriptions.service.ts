@@ -293,9 +293,37 @@ export class SubscriptionsService {
       return false;
     }
     await this.memberships.assertOrganizationAccess(user, organizationId);
+    return this.isOrganizationWriteBlocked(organizationId);
+  }
+
+  // The pure, user-independent half of the policy - added for Phase 9
+  // (Complaints), which surfaced a real gap `isAccessBlocked` above
+  // could not fill: a *tenant* creating a complaint is not an
+  // `OrganizationMembership` row at all (the same "tenant is connected
+  // to an organization only through Residency.tenant.userId, not
+  // membership" fact Phase 6 already had to solve for payments - see
+  // README's "Phase 6" section), so `assertOrganizationAccess` would
+  // wrongly reject a legitimate tenant here. Callers of this method must
+  // have already established the caller's legitimate relationship to
+  // `organizationId` through their own domain logic (a residency lookup
+  // for a tenant, a membership check for OWNER/MANAGER/STAFF) - this
+  // method only ever answers "is this organization's subscription
+  // currently blocking normal writes," never "is this caller allowed to
+  // know that."
+  //
+  // Phase 9's documented policy (spec's "RECOMMENDED SUBSCRIPTION ACCESS
+  // POLICY"): TRIAL/ACTIVE/RENEWAL_DUE/GRACE_PERIOD remain fully
+  // operational; SUSPENDED and CANCELLED block normal operational
+  // writes. This is a superset of `isAccessBlocked`'s own SUSPENDED-only
+  // check (kept unchanged above, to avoid altering Phase 7's existing
+  // behavior) - CANCELLED is additionally blocking here because a
+  // cancelled subscription has no recovery path back to ACTIVE at all
+  // (see Phase 7's lifecycle), so there is no "let them keep working
+  // while they fix billing" case to preserve for it, unlike SUSPENDED.
+  async isOrganizationWriteBlocked(organizationId: string): Promise<boolean> {
     const subscription = await this.ensureSubscriptionExists(organizationId);
     const evaluated = await this.evaluateLifecycle(subscription.id);
-    return evaluated.status === 'SUSPENDED';
+    return evaluated.status === 'SUSPENDED' || evaluated.status === 'CANCELLED';
   }
 
   private async ensureSubscriptionExists(

@@ -286,6 +286,150 @@ enum RefundStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Complaints & maintenance (Phase 9)
+// ---------------------------------------------------------------------------
+
+// Kept small on purpose (spec: "do not create dozens of categories") -
+// OTHER is the deliberate escape hatch, the same pattern RoomType (Phase
+// 3) already uses.
+enum ComplaintCategory {
+  PLUMBING
+  ELECTRICAL
+  WIFI
+  CLEANING
+  ROOM
+  BED
+  FURNITURE
+  FOOD
+  SECURITY
+  MAINTENANCE
+  OTHER
+}
+
+// A tenant may *suggest* a priority at creation time, but it is never
+// trusted blindly (spec: "do not blindly trust tenant-supplied URGENT") -
+// see ComplaintsService.create for the actual rule.
+enum ComplaintPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+// OPEN -> ASSIGNED -> IN_PROGRESS -> RESOLVED -> CLOSED, or OPEN ->
+// CANCELLED. No REOPENED value here - Phase 9 does not implement a
+// reopen operation (spec: "only implement this if the workflow requires
+// it" - it doesn't yet); ComplaintActivityType keeps a REOPENED value
+// ready for when it does, since recording that it *could* happen is
+// cheap but adding the actual state later would be a data migration.
+// Every transition is decided by ComplaintLifecycleService, never a
+// client-supplied status field (spec: "do NOT use unrestricted PATCH for
+// lifecycle state") - the same "action-based, not generic PATCH"
+// principle every lifecycle in this codebase already uses.
+enum ComplaintStatus {
+  OPEN
+  ASSIGNED
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+  CANCELLED
+}
+
+// A permanent, append-only record of what happened to a complaint - the
+// server creates these as a side effect of real operations; there is no
+// endpoint that accepts a client-submitted activity record (the same
+// principle as Phase 8's AuditLog).
+enum ComplaintActivityType {
+  CREATED
+  ASSIGNED
+  UNASSIGNED
+  STATUS_CHANGED
+  PRIORITY_CHANGED
+  COMMENT_ADDED
+  RESOLVED
+  CLOSED
+  CANCELLED
+  REOPENED
+}
+
+// PUBLIC - visible to the tenant, the assignee, and any
+// OWNER/MANAGER/STAFF of the organization. INTERNAL - visible only to
+// OWNER/MANAGER/STAFF (and SUPER_ADMIN) - a tenant must never see an
+// INTERNAL comment (spec: "tenant must never see INTERNAL comments").
+// Enforced by ComplaintsService's response-shaping, never left to the
+// client to filter.
+enum ComplaintCommentVisibility {
+  PUBLIC
+  INTERNAL
+}
+
+// ---------------------------------------------------------------------------
+// Food / meals / menu (Phase 10)
+//
+// A third, deliberately separate financial domain (spec section 4): rent
+// (Phase 5/6), SaaS (Phase 7), and now food - a food subscription payment
+// must never become tenant rent volume or feed OwnerSettlement (spec
+// section 46/47). Reuses `PaymentProvider`/`BillingCycle` (Phase 6/5)
+// where the meaning is identical, but defines its own invoice/payment
+// status enums - mirroring, never reusing, Phase 7's SaaS billing shape
+// (see README's "Phase 10" section for why).
+// ---------------------------------------------------------------------------
+
+enum MealType {
+  BREAKFAST
+  LUNCH
+  DINNER
+  SNACK
+  OTHER
+}
+
+enum FoodPlanStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+enum FoodSubscriptionStatus {
+  ACTIVE
+  PAUSED
+  CANCELLED
+  EXPIRED
+}
+
+enum MenuStatus {
+  DRAFT
+  PUBLISHED
+  CANCELLED
+}
+
+enum MealConsumptionSource {
+  STAFF_MARKED
+  TENANT_MARKED
+  SYSTEM
+}
+
+// Deliberately a narrower lifecycle than Phase 5's InvoiceStatus (no
+// PARTIALLY_PAID) - a food subscription invoice is always paid in full by
+// exactly one successful FoodSubscriptionPayment, never partially.
+enum FoodSubscriptionInvoiceStatus {
+  DRAFT
+  ISSUED
+  OVERDUE
+  PAID
+  VOID
+}
+
+enum FoodSubscriptionPaymentStatus {
+  CREATED
+  PENDING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+// ---------------------------------------------------------------------------
 // Owner SaaS subscription (Phase 7)
 //
 // A completely separate financial domain from Phase 6: the PG *owner*
@@ -370,12 +514,18 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  memberships           OrganizationMembership[]
-  refreshTokens         RefreshToken[]
-  tenant                Tenant?
-  identityVerifications IdentityVerification[]
-  payments              Payment[]
-  auditLogs             AuditLog[]
+  memberships            OrganizationMembership[]
+  refreshTokens          RefreshToken[]
+  tenant                 Tenant?
+  identityVerifications  IdentityVerification[]
+  payments               Payment[]
+  auditLogs              AuditLog[]
+  reportedComplaints     Complaint[]              @relation("ComplaintReporter")
+  assignedComplaints     Complaint[]              @relation("ComplaintAssignee")
+  complaintActivities    ComplaintActivity[]
+  complaintComments      ComplaintComment[]
+  complaintAttachments   ComplaintAttachment[]
+  mealConsumptionsMarked MealConsumption[]        @relation("MealConsumptionMarkedBy")
 
   @@map("users")
 }
@@ -430,12 +580,12 @@ model RefreshToken {
 // but not yet for address" or preserve history of a failed then later
 // successful attempt.
 model IdentityVerification {
-  id                String                      @id @default(uuid())
+  id                String                     @id @default(uuid())
   userId            String
-  user              User                        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user              User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
   verificationType  IdentityVerificationType
   provider          String?
-  status            IdentityVerificationStatus  @default(NOT_STARTED)
+  status            IdentityVerificationStatus @default(NOT_STARTED)
   providerReference String?
   verifiedAt        DateTime?
   expiresAt         DateTime?
@@ -462,15 +612,24 @@ model Organization {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  memberships OrganizationMembership[]
-  properties  Property[]
-  payments    Payment[]
-  settlements OwnerSettlement[]
+  memberships    OrganizationMembership[]
+  properties     Property[]
+  payments       Payment[]
+  settlements    OwnerSettlement[]
   paymentAccount OwnerPaymentAccount?
 
   subscription         OrganizationSubscription?
   subscriptionInvoices SubscriptionInvoice[]
   subscriptionPayments SubscriptionPayment[]
+  complaints           Complaint[]
+
+  foodConfigurations       FoodConfiguration[]
+  foodPlans                FoodPlan[]
+  foodSubscriptions        TenantFoodSubscription[]
+  foodSubscriptionInvoices FoodSubscriptionInvoice[]
+  foodSubscriptionPayments FoodSubscriptionPayment[]
+  menus                    Menu[]
+  mealConsumptions         MealConsumption[]
 
   @@map("organizations")
 }
@@ -527,6 +686,15 @@ model Property {
   rooms       Room[]
   residencies Residency[]
   payments    Payment[]
+  complaints  Complaint[]
+
+  foodConfiguration        FoodConfiguration?
+  foodPlans                FoodPlan[]
+  foodSubscriptions        TenantFoodSubscription[]
+  foodSubscriptionInvoices FoodSubscriptionInvoice[]
+  foodSubscriptionPayments FoodSubscriptionPayment[]
+  menus                    Menu[]
+  mealConsumptions         MealConsumption[]
 
   @@index([organizationId])
   // Every tenant-scoped "list my properties" / "is this property archived"
@@ -560,7 +728,8 @@ model Room {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  beds Bed[]
+  beds       Bed[]
+  complaints Complaint[]
 
   @@unique([propertyId, roomNumber])
   @@index([propertyId])
@@ -581,6 +750,7 @@ model Bed {
   updatedAt DateTime @updatedAt
 
   allocations BedAllocation[]
+  complaints  Complaint[]
 
   @@unique([roomId, bedNumber])
   @@index([roomId])
@@ -625,6 +795,12 @@ model Tenant {
   updatedAt DateTime @updatedAt
 
   residencies Residency[]
+  complaints  Complaint[]
+
+  foodSubscriptions        TenantFoodSubscription[]
+  foodSubscriptionInvoices FoodSubscriptionInvoice[]
+  foodSubscriptionPayments FoodSubscriptionPayment[]
+  mealConsumptions         MealConsumption[]
 
   @@map("tenants")
 }
@@ -672,6 +848,12 @@ model Residency {
   rentPlans   RentPlan[]
   invoices    Invoice[]
   payments    Payment[]
+  complaints  Complaint[]
+
+  foodSubscriptions        TenantFoodSubscription[]
+  foodSubscriptionInvoices FoodSubscriptionInvoice[]
+  foodSubscriptionPayments FoodSubscriptionPayment[]
+  mealConsumptions         MealConsumption[]
 
   @@index([tenantId])
   @@index([propertyId])
@@ -816,8 +998,8 @@ model Invoice {
   issueDate          DateTime?
   dueDate            DateTime
   subtotal           Decimal       @db.Decimal(12, 2)
-  discount           Decimal       @db.Decimal(12, 2) @default(0)
-  tax                Decimal       @db.Decimal(12, 2) @default(0)
+  discount           Decimal       @default(0) @db.Decimal(12, 2)
+  tax                Decimal       @default(0) @db.Decimal(12, 2)
   total              Decimal       @db.Decimal(12, 2)
   currency           String        @default("INR")
   status             InvoiceStatus @default(DRAFT)
@@ -898,22 +1080,22 @@ model InvoiceItem {
 // scope survives even if the invoice were ever reassigned (it is not, but
 // the columns make that assumption explicit rather than implicit).
 model Payment {
-  id             String   @id @default(uuid())
+  id             String       @id @default(uuid())
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   propertyId     String
-  property       Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  property       Property     @relation(fields: [propertyId], references: [id], onDelete: Cascade)
   residencyId    String
-  residency      Residency @relation(fields: [residencyId], references: [id], onDelete: Cascade)
+  residency      Residency    @relation(fields: [residencyId], references: [id], onDelete: Cascade)
   invoiceId      String
-  invoice        Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  invoice        Invoice      @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
   payerUserId    String
-  payerUser      User     @relation(fields: [payerUserId], references: [id], onDelete: Cascade)
+  payerUser      User         @relation(fields: [payerUserId], references: [id], onDelete: Cascade)
 
-  amount                Decimal       @db.Decimal(12, 2)
-  currency              String        @default("INR")
-  platformFee           Decimal       @db.Decimal(12, 2) @default(0)
-  ownerSettlementAmount Decimal       @db.Decimal(12, 2) @default(0)
+  amount                Decimal @db.Decimal(12, 2)
+  currency              String  @default("INR")
+  platformFee           Decimal @default(0) @db.Decimal(12, 2)
+  ownerSettlementAmount Decimal @default(0) @db.Decimal(12, 2)
 
   // Populated from the gateway once known (e.g. "card", "upi",
   // "netbanking") - never client-supplied at order-creation time.
@@ -993,12 +1175,12 @@ model PaymentAllocation {
 // because `Payment.platformFee` is a snapshot, not a live lookup (see
 // Payment's own doc comment).
 model PlatformFeeRule {
-  id        String          @id @default(uuid())
-  feeType   PlatformFeeType @default(FIXED)
+  id       String          @id @default(uuid())
+  feeType  PlatformFeeType @default(FIXED)
   // For feeType FIXED: the flat fee amount charged per successful payment
   // (e.g. "1.00"). No percentage field exists yet - see PlatformFeeType.
-  amount    Decimal         @db.Decimal(12, 2)
-  isActive  Boolean         @default(true)
+  amount   Decimal         @db.Decimal(12, 2)
+  isActive Boolean         @default(true)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1018,13 +1200,13 @@ model PlatformFeeRule {
 // keeps a future per-property override possible as a schema addition
 // later, never a required rewrite of this table.
 model OwnerPaymentAccount {
-  id                 String                    @id @default(uuid())
-  organizationId     String                    @unique
-  organization       Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  provider           PaymentProvider           @default(RAZORPAY)
-  providerAccountId  String                    @unique
-  status             OwnerPaymentAccountStatus @default(PENDING)
-  onboardingStatus   String?
+  id                String                    @id @default(uuid())
+  organizationId    String                    @unique
+  organization      Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  provider          PaymentProvider           @default(RAZORPAY)
+  providerAccountId String                    @unique
+  status            OwnerPaymentAccountStatus @default(PENDING)
+  onboardingStatus  String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1046,18 +1228,18 @@ model OwnerPaymentAccount {
 // records (spec sections 38/44). `providerTransferId` is unique "where
 // present" (null until the gateway confirms a transfer).
 model OwnerSettlement {
-  id                    String              @id @default(uuid())
-  paymentId             String              @unique
-  payment               Payment             @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  id                    String               @id @default(uuid())
+  paymentId             String               @unique
+  payment               Payment              @relation(fields: [paymentId], references: [id], onDelete: Cascade)
   organizationId        String
-  organization          Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organization          Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   ownerPaymentAccountId String?
   ownerPaymentAccount   OwnerPaymentAccount? @relation(fields: [ownerPaymentAccountId], references: [id], onDelete: SetNull)
 
-  grossAmount       Decimal @db.Decimal(12, 2)
-  platformFee       Decimal @db.Decimal(12, 2)
-  settlementAmount  Decimal @db.Decimal(12, 2)
-  currency          String  @default("INR")
+  grossAmount      Decimal @db.Decimal(12, 2)
+  platformFee      Decimal @db.Decimal(12, 2)
+  settlementAmount Decimal @db.Decimal(12, 2)
+  currency         String  @default("INR")
 
   providerTransferId String?          @unique
   status             SettlementStatus @default(PENDING)
@@ -1084,14 +1266,14 @@ model OwnerSettlement {
 // invent or assume; see README's "Phase 6" section and the Final Report's
 // "known limitations" for what is and isn't handled here.
 model Refund {
-  id                String       @id @default(uuid())
-  paymentId         String
-  payment           Payment      @relation(fields: [paymentId], references: [id], onDelete: Cascade)
-  amount            Decimal      @db.Decimal(12, 2)
-  reason            String?
-  status            RefundStatus @default(PENDING)
-  providerRefundId  String?      @unique
-  failureReason     String?
+  id               String       @id @default(uuid())
+  paymentId        String
+  payment          Payment      @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  amount           Decimal      @db.Decimal(12, 2)
+  reason           String?
+  status           RefundStatus @default(PENDING)
+  providerRefundId String?      @unique
+  failureReason    String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1235,19 +1417,19 @@ model OrganizationSubscription {
 // (non-partial) unique constraint, the same pattern Phase 5 uses for
 // `invoices_residency_billing_period_unique`.
 model SubscriptionInvoice {
-  id             String       @id @default(uuid())
+  id             String                   @id @default(uuid())
   organizationId String
-  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organization   Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   subscriptionId String
   subscription   OrganizationSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
   saasPlanId     String
-  saasPlan       SaasPlan     @relation(fields: [saasPlanId], references: [id], onDelete: Restrict)
+  saasPlan       SaasPlan                 @relation(fields: [saasPlanId], references: [id], onDelete: Restrict)
 
   invoiceNumber      String                    @unique
   billingPeriodStart DateTime
   billingPeriodEnd   DateTime
   subtotal           Decimal                   @db.Decimal(12, 2)
-  tax                Decimal                   @db.Decimal(12, 2) @default(0)
+  tax                Decimal                   @default(0) @db.Decimal(12, 2)
   total              Decimal                   @db.Decimal(12, 2)
   currency           String                    @default("INR")
   status             SubscriptionInvoiceStatus @default(ISSUED)
@@ -1287,13 +1469,13 @@ model SubscriptionInvoice {
 // and does so at most once per invoice (see its own docs for the
 // concurrency guarantee).
 model SubscriptionPayment {
-  id             String       @id @default(uuid())
-  organizationId String
-  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  subscriptionId String
-  subscription   OrganizationSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  id                    String                   @id @default(uuid())
+  organizationId        String
+  organization          Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  subscriptionId        String
+  subscription          OrganizationSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
   subscriptionInvoiceId String
-  subscriptionInvoice   SubscriptionInvoice @relation(fields: [subscriptionInvoiceId], references: [id], onDelete: Cascade)
+  subscriptionInvoice   SubscriptionInvoice      @relation(fields: [subscriptionInvoiceId], references: [id], onDelete: Cascade)
 
   amount   Decimal                   @db.Decimal(12, 2)
   currency String                    @default("INR")
@@ -1338,9 +1520,9 @@ model SubscriptionPayment {
 // change affects no single organization). `metadata` never contains
 // secrets/passwords/tokens - see AuditLogService's doc comment.
 model AuditLog {
-  id             String   @id @default(uuid())
+  id             String  @id @default(uuid())
   actorUserId    String
-  actorUser      User     @relation(fields: [actorUserId], references: [id], onDelete: Cascade)
+  actorUser      User    @relation(fields: [actorUserId], references: [id], onDelete: Cascade)
   action         String
   entityType     String
   entityId       String
@@ -1354,4 +1536,478 @@ model AuditLog {
   @@index([action])
   @@index([createdAt])
   @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Complaints & maintenance (Phase 9)
+//
+// A tenant reports a problem with their room/bed/property; OWNER/MANAGER/
+// STAFF triage, assign, and resolve it. Deliberately reuses every existing
+// relationship instead of duplicating tenant/property/room context
+// (spec: "do not create duplicate tenant/property/room models").
+// ---------------------------------------------------------------------------
+
+// `residencyId` (and, where known, `roomId`/`bedId`) are captured at
+// creation time and never re-derived from the tenant's *current*
+// residency later (spec: "a historical complaint must still point to the
+// context in which it was created... do not make historical complaints
+// dynamically resolve only from the tenant's current residency") - a
+// tenant who moves from Room 101 to Room 203 keeps their old complaint
+// pointing at Room 101. `tenantId` is denormalized alongside
+// `residencyId` (never the sole source of truth - always cross-checked
+// against the residency at creation) purely for query performance, the
+// same denormalization Phase 6's `Payment` already does for its own
+// organization/property/residency columns.
+//
+// `roomId`/`bedId` are nullable and `onDelete: SetNull` - a complaint
+// about "the property in general" (spec: room/bed context is one of
+// several - property, facilities, utilities, services) never requires
+// either. `reportedByUserId` is `onDelete: Restrict` (a complaint must
+// never lose who reported it); `assignedToUserId` is `onDelete: SetNull`
+// (an assignee's account being removed should never destroy the
+// complaint itself - see "Relation integrity" in README's "Phase 9"
+// section for the full reasoning on every one of these choices).
+model Complaint {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId     String
+  property       Property     @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  residencyId    String
+  residency      Residency    @relation(fields: [residencyId], references: [id], onDelete: Cascade)
+  tenantId       String
+  tenant         Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  roomId         String?
+  room           Room?        @relation(fields: [roomId], references: [id], onDelete: SetNull)
+  bedId          String?
+  bed            Bed?         @relation(fields: [bedId], references: [id], onDelete: SetNull)
+
+  reportedByUserId String
+  reportedByUser   User    @relation("ComplaintReporter", fields: [reportedByUserId], references: [id], onDelete: Restrict)
+  assignedToUserId String?
+  assignedToUser   User?   @relation("ComplaintAssignee", fields: [assignedToUserId], references: [id], onDelete: SetNull)
+
+  category    ComplaintCategory @default(OTHER)
+  priority    ComplaintPriority @default(MEDIUM)
+  status      ComplaintStatus   @default(OPEN)
+  title       String
+  description String
+
+  resolutionNote String?
+  resolvedAt     DateTime?
+  closedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  activities  ComplaintActivity[]
+  comments    ComplaintComment[]
+  attachments ComplaintAttachment[]
+
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@index([organizationId, createdAt])
+  @@index([propertyId])
+  @@index([residencyId])
+  @@index([tenantId, createdAt])
+  @@index([assignedToUserId, status])
+  @@index([status])
+  @@index([priority])
+  @@index([category])
+  @@map("complaints")
+}
+
+// Append-only activity trail - never updated or deleted (spec: "do not
+// allow PATCH/DELETE on complaint activities"). Every lifecycle-relevant
+// mutation in ComplaintLifecycleService writes exactly one row here in
+// the same transaction as the mutation itself, so the trail can never
+// drift from what actually happened. `old*`/`new*` columns are nullable
+// because most activity types only ever populate one pair (e.g.
+// `STATUS_CHANGED` sets `oldStatus`/`newStatus` and leaves the priority/
+// assignee pairs null).
+model ComplaintActivity {
+  id          String                @id @default(uuid())
+  complaintId String
+  complaint   Complaint             @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  actorUserId String
+  actorUser   User                  @relation(fields: [actorUserId], references: [id], onDelete: Restrict)
+  type        ComplaintActivityType
+
+  oldStatus     ComplaintStatus?
+  newStatus     ComplaintStatus?
+  oldPriority   ComplaintPriority?
+  newPriority   ComplaintPriority?
+  oldAssigneeId String?
+  newAssigneeId String?
+  comment       String?
+  metadata      Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([complaintId, createdAt])
+  @@map("complaint_activities")
+}
+
+// PUBLIC/INTERNAL visibility is enforced entirely in
+// ComplaintsService's read path (never trust a client to filter its own
+// response) - see ComplaintCommentVisibility's own doc comment.
+model ComplaintComment {
+  id           String                     @id @default(uuid())
+  complaintId  String
+  complaint    Complaint                  @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  authorUserId String
+  authorUser   User                       @relation(fields: [authorUserId], references: [id], onDelete: Restrict)
+  body         String
+  visibility   ComplaintCommentVisibility @default(PUBLIC)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([complaintId, createdAt])
+  @@map("complaint_comments")
+}
+
+// A minimal reference model, deliberately never a file-storage platform
+// (spec: "do NOT build a complicated file-storage platform unless one
+// already exists" - this project has none). `url` points at wherever the
+// client actually uploaded the file (out of scope for Phase 9); this
+// table only registers that it exists, who uploaded it, and enough
+// metadata (`mimeType`/`size`) for ComplaintAttachmentsService to
+// validate it server-side before accepting the registration - see
+// README's "Phase 9" section for the exact allowlist/size limit and why
+// no upload endpoint exists here.
+model ComplaintAttachment {
+  id               String    @id @default(uuid())
+  complaintId      String
+  complaint        Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  uploadedByUserId String
+  uploadedByUser   User      @relation(fields: [uploadedByUserId], references: [id], onDelete: Restrict)
+  url              String
+  fileName         String
+  mimeType         String
+  size             Int
+
+  createdAt DateTime @default(now())
+
+  @@index([complaintId])
+  @@map("complaint_attachments")
+}
+
+// ---------------------------------------------------------------------------
+// Food / meals / menu (Phase 10)
+// ---------------------------------------------------------------------------
+
+// One row per property - "does this property do food at all, and how."
+// `includedMealTypes` is only meaningful when `mealsIncludedInRent` is
+// true; it is never re-derived from anywhere else (spec's Model A/B/C:
+// a property can have meals included in rent, an optional paid
+// subscription, both, or neither - see FoodEntitlementService for how
+// these two independent facts combine into one entitlement view).
+model FoodConfiguration {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId     String       @unique
+  property       Property     @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  enabled                     Boolean    @default(false)
+  mealsIncludedInRent         Boolean    @default(false)
+  includedMealTypes           MealType[] @default([])
+  optionalSubscriptionEnabled Boolean    @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId])
+  @@map("food_configurations")
+}
+
+// A billable food tier offered at one property (spec: "food configuration
+// belongs to a property," never organization-wide). `status` follows the
+// same ACTIVE/INACTIVE/ARCHIVED shape as SaasPlan - only ACTIVE plans can
+// be newly subscribed to; ARCHIVED plans are retired but never deleted
+// because historical `TenantFoodSubscription`/`FoodSubscriptionInvoice`
+// rows still reference them (spec section 13). `price` is the plan's
+// *current* price - a subscribing tenant's own agreed price is snapshotted
+// separately onto `TenantFoodSubscription.priceSnapshot` (see its own doc
+// comment), the same "plan price changes, historical record doesn't"
+// principle as Phase 5's RentPlan/Invoice and Phase 7's SaasPlan/
+// SubscriptionInvoice.
+model FoodPlan {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId     String
+  property       Property     @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  name         String
+  description  String?
+  status       FoodPlanStatus @default(ACTIVE)
+  billingCycle BillingCycle   @default(MONTHLY)
+  price        Decimal        @db.Decimal(12, 2)
+  currency     String         @default("INR")
+  mealTypes    MealType[]     @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subscriptions TenantFoodSubscription[]
+
+  @@index([organizationId])
+  @@index([propertyId, status])
+  @@map("food_plans")
+}
+
+// One tenant's optional paid food subscription against one residency -
+// deliberately separate from `FoodConfiguration.mealsIncludedInRent`
+// (Model A never creates one of these rows at all, spec section 17).
+// `priceSnapshot`/`currency` capture the plan's price *at subscribe time*
+// (spec section 15) - never recalculated from `FoodPlan.price` later, the
+// same historical-integrity rule as every other snapshot in this schema.
+// `mealTypesSnapshot` similarly freezes which meals this subscription
+// actually covers, so a later edit to `FoodPlan.mealTypes` cannot silently
+// change what an existing subscriber is entitled to.
+//
+// At most one ACTIVE subscription per residency is enforced by a partial
+// unique index added by hand in this phase's migration SQL (Prisma's
+// schema DSL cannot express a WHERE clause on a unique index - the same
+// limitation already documented for Residency/BedAllocation/RentPlan):
+//   CREATE UNIQUE INDEX food_subscriptions_active_residency_unique
+//     ON tenant_food_subscriptions ("residencyId") WHERE status = 'ACTIVE';
+model TenantFoodSubscription {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId     String
+  property       Property     @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  tenantId       String
+  tenant         Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  residencyId    String
+  residency      Residency    @relation(fields: [residencyId], references: [id], onDelete: Cascade)
+  foodPlanId     String
+  foodPlan       FoodPlan     @relation(fields: [foodPlanId], references: [id], onDelete: Restrict)
+
+  status FoodSubscriptionStatus @default(ACTIVE)
+
+  startDate DateTime
+  endDate   DateTime?
+
+  priceSnapshot     Decimal    @db.Decimal(12, 2)
+  currency          String     @default("INR")
+  mealTypesSnapshot MealType[] @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoices FoodSubscriptionInvoice[]
+  payments FoodSubscriptionPayment[]
+
+  @@index([organizationId])
+  @@index([propertyId])
+  @@index([tenantId, createdAt])
+  @@index([residencyId, status])
+  @@map("tenant_food_subscriptions")
+}
+
+// A permanent financial record - "how much this subscription owed for
+// this billing period" - snapshotted at generation time exactly like
+// Phase 5's Invoice and Phase 7's SubscriptionInvoice; never recalculated
+// from a later `FoodPlan.price`/`TenantFoodSubscription.priceSnapshot`
+// change. `invoiceNumber` is generated from a dedicated Postgres sequence
+// (`food_invoice_number_seq`, created by hand in this phase's migration
+// SQL) - never `COUNT(*) + 1`.
+//
+// One invoice per subscription per billing period is enforced by a plain
+// (non-partial) unique constraint, the same pattern as Phase 5/7's own
+// billing-period uniqueness - given an explicit `map` so the actual
+// Postgres constraint carries this name (Phase 6/7's own lesson: `name`
+// alone never renames the database object, only the generated client API -
+// see README's "Phase 6"/"Phase 7" sections).
+model FoodSubscriptionInvoice {
+  id                 String                 @id @default(uuid())
+  organizationId     String
+  organization       Organization           @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId         String
+  property           Property               @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  tenantId           String
+  tenant             Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  residencyId        String
+  residency          Residency              @relation(fields: [residencyId], references: [id], onDelete: Cascade)
+  foodSubscriptionId String
+  foodSubscription   TenantFoodSubscription @relation(fields: [foodSubscriptionId], references: [id], onDelete: Cascade)
+
+  invoiceNumber      String                        @unique
+  billingPeriodStart DateTime
+  billingPeriodEnd   DateTime
+  subtotal           Decimal                       @db.Decimal(12, 2)
+  tax                Decimal                       @default(0) @db.Decimal(12, 2)
+  total              Decimal                       @db.Decimal(12, 2)
+  currency           String                        @default("INR")
+  status             FoodSubscriptionInvoiceStatus @default(ISSUED)
+  issuedAt           DateTime?
+  dueAt              DateTime
+  paidAt             DateTime?
+  voidedAt           DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payments FoodSubscriptionPayment[]
+
+  @@unique([foodSubscriptionId, billingPeriodStart, billingPeriodEnd], name: "food_subscription_invoices_period_unique", map: "food_subscription_invoices_period_unique")
+  @@index([organizationId, status])
+  @@index([tenantId, createdAt])
+  @@index([dueAt, status])
+  @@map("food_subscription_invoices")
+}
+
+// One payment attempt/transaction against exactly one
+// FoodSubscriptionInvoice - deliberately its own table, never Phase 6's
+// `Payment` (spec section 5: "must NOT modify the existing Phase 6
+// Payment model") and never creates a `PaymentAllocation`/
+// `OwnerSettlement` (spec section 46) - there is no platform
+// fee/owner-settlement split for food, the organization keeps 100% of
+// what a tenant pays for food, same reasoning Phase 7's
+// `SubscriptionPayment` already established for SaaS payments.
+model FoodSubscriptionPayment {
+  id                        String                  @id @default(uuid())
+  organizationId            String
+  organization              Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId                String
+  property                  Property                @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  tenantId                  String
+  tenant                    Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  residencyId               String
+  residency                 Residency               @relation(fields: [residencyId], references: [id], onDelete: Cascade)
+  foodSubscriptionId        String
+  foodSubscription          TenantFoodSubscription  @relation(fields: [foodSubscriptionId], references: [id], onDelete: Cascade)
+  foodSubscriptionInvoiceId String
+  foodSubscriptionInvoice   FoodSubscriptionInvoice @relation(fields: [foodSubscriptionInvoiceId], references: [id], onDelete: Cascade)
+
+  amount   Decimal                       @db.Decimal(12, 2)
+  currency String                        @default("INR")
+  provider PaymentProvider               @default(RAZORPAY)
+  status   FoodSubscriptionPaymentStatus @default(CREATED)
+
+  providerOrderId   String? @unique
+  providerPaymentId String? @unique
+  idempotencyKey    String? @unique
+
+  failureCode    String?
+  failureMessage String?
+  capturedAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId])
+  @@index([tenantId])
+  @@index([foodSubscriptionInvoiceId])
+  @@map("food_subscription_payments")
+}
+
+// A date-specific, immutable-once-past menu record - never a single
+// mutable "current menu" row (spec section 34: "do not build a single
+// mutable current menu table"). Editing October 2nd's menu can never
+// touch October 1st's, because they are different rows entirely.
+// `@@unique([propertyId, date])` is both the uniqueness guarantee (spec
+// section 22) and what a concurrent "create today's menu" race resolves
+// against - two simultaneous creates for the same property/date produce
+// exactly one row and one P2002, translated to `MENU_ALREADY_EXISTS`
+// (spec section 61), never a duplicate menu.
+model Menu {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId     String
+  property       Property     @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  date   DateTime   @db.Date
+  status MenuStatus @default(DRAFT)
+
+  publishedAt DateTime?
+  cancelledAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items            MenuItem[]
+  mealConsumptions MealConsumption[]
+
+  @@unique([propertyId, date])
+  @@index([organizationId])
+  @@index([propertyId, status])
+  @@map("menus")
+}
+
+// One dish/item within one meal of one menu. Deliberately per-menu, never
+// a shared/reusable "dish catalog" (spec section 24: "do not hardcode
+// food items") - OWNER/MANAGER type in whatever that day's kitchen is
+// actually serving.
+model MenuItem {
+  id     String @id @default(uuid())
+  menuId String
+  menu   Menu   @relation(fields: [menuId], references: [id], onDelete: Cascade)
+
+  mealType     MealType
+  name         String
+  description  String?
+  isVegetarian Boolean  @default(true)
+  isAvailable  Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  mealConsumptions MealConsumption[]
+
+  @@index([menuId])
+  @@index([menuId, mealType])
+  @@map("menu_items")
+}
+
+// A record that a specific tenant actually had a specific meal on a
+// specific date - deliberately NOT derived from the Menu at read time
+// (spec section 40): `itemNamesSnapshot` freezes what was actually served
+// at the moment of consumption, so a later edit to that day's `MenuItem`
+// rows (spec section 40's Chole/Paneer example) can never rewrite what a
+// tenant is recorded as having eaten. `menuId`/`menuItemId` are kept only
+// for traceability (`onDelete: SetNull`/`Cascade` follow the menu's own
+// lifecycle) - never re-read to reconstruct history.
+//
+// `@@unique([residencyId, mealDate, mealType])` prevents duplicate
+// consumption for the same meal period (spec section 39) - a database
+// constraint, not just an application-level check, so two concurrent
+// "mark consumed" calls for the same tenant/meal/day can never both
+// succeed.
+model MealConsumption {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  propertyId     String
+  property       Property     @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  tenantId       String
+  tenant         Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  residencyId    String
+  residency      Residency    @relation(fields: [residencyId], references: [id], onDelete: Cascade)
+  menuId         String?
+  menu           Menu?        @relation(fields: [menuId], references: [id], onDelete: SetNull)
+  menuItemId     String?
+  menuItem       MenuItem?    @relation(fields: [menuItemId], references: [id], onDelete: SetNull)
+
+  mealType          MealType
+  mealDate          DateTime              @db.Date
+  itemNamesSnapshot String[]              @default([])
+  consumedAt        DateTime              @default(now())
+  source            MealConsumptionSource @default(STAFF_MARKED)
+  markedByUserId    String?
+  markedByUser      User?                 @relation("MealConsumptionMarkedBy", fields: [markedByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@unique([residencyId, mealDate, mealType], name: "meal_consumption_unique")
+  @@index([organizationId])
+  @@index([propertyId])
+  @@index([tenantId, mealDate])
+  @@index([menuId])
+  @@map("meal_consumptions")
 }

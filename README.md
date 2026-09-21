@@ -7,7 +7,7 @@ This repository is backend-only. The mobile apps (owner/manager and
 student) are separate React Native / Expo projects and are not part of
 this codebase.
 
-## Status: Phase 8 - Super Admin / Founder Platform Management
+## Status: Phase 10 - Food, Meals & Menu
 
 Phase 0 delivered the foundation: project setup, configuration, database
 connectivity, the core multi-tenant data model, global error handling,
@@ -65,9 +65,54 @@ Super Admin registration endpoint exists, or ever will). Phase 8
 intentionally does **not** include a platform-admin UI, SaaS coupons/
 promotions, a full plan-versioning history table, wiring the new
 suspension-access policy into every existing Phase 0-6 controller (a
-deliberately flagged gap - see "Known limitations" below), PG
+deliberately flagged gap, resolved in Phase 9 - see below), PG
 applications, visit booking, complaints, food, notifications, the student
 marketplace, or roommate matching (see "Roadmap").
+
+Phase 9 adds `Complaint`/`ComplaintActivity`/
+`ComplaintComment`/`ComplaintAttachment`: a tenant reports an issue
+against their own current residency, `OWNER`/`MANAGER`/`STAFF` triage,
+assign, work, and resolve it through an explicit action-based lifecycle
+(never a generic `PATCH {status}`), every transition is recorded in an
+immutable server-only activity trail, and comments carry `PUBLIC`/
+`INTERNAL` visibility so a tenant never sees an organization's internal
+notes. This phase also resolves Phase 8's flagged gap: it introduces
+`SubscriptionsService.isOrganizationWriteBlocked(organizationId)`, a new
+user-independent half of the subscription-access policy, and wires it
+into every complaint-creating/complaint-mutating action (`SUSPENDED` and
+`CANCELLED` both block; `SUPER_ADMIN` bypasses) - see "Phase 9" below for
+the full policy and why it is a superset of the pre-existing, still-
+unwired `isAccessBlocked`. Phase 9 intentionally does **not** include SLA/
+escalation timers, notification delivery (clean hooks only), complaint
+reopening, or a general-purpose file-storage platform for attachments
+(URL references only) - see "Phase 9" below.
+
+Phase 10 (this repository, current) adds a complete food/meals/menu
+domain that supports three independent business models at once: meals
+included in rent (`FoodConfiguration.mealsIncludedInRent` +
+`includedMealTypes`, tracked operationally, never separately billed),
+an optional paid food subscription (`FoodPlan` -> `TenantFoodSubscription`
+-> `FoodSubscriptionInvoice` -> `FoodSubscriptionPayment`, a third money
+flow that never touches Phase 6's `Payment`/`PaymentAllocation`/
+`OwnerSettlement` or Phase 7's SaaS billing tables), or both at once
+(`FoodEntitlementService` combines them into one deduplicated
+`includedMeals`/`subscriptionMeals` view). A date-specific `Menu`/
+`MenuItem` system (never a single mutable "current menu" row) gives
+`OWNER`/`MANAGER` daily and weekly menu management with an explicit
+DRAFT -> PUBLISHED lifecycle, and a `MealConsumption` record - snapshotting
+what was actually served - gives staff a simple, non-duplicable way to
+mark a resident's meal as consumed. The tenant-facing `/me/food/*`
+surface is the backend-is-the-source-of-truth dashboard: entitlement,
+today's/this week's published menu, and subscription/invoice management,
+all resolved from the caller's own current residency, never a
+client-supplied id. Phase 10 reuses Phase 9's
+`isOrganizationWriteBlocked` gate for every food-mutating action, and
+hooks into Phase 4's residency checkout to end an active food
+subscription without deleting its history. Phase 10 intentionally does
+**not** include recurring/templated weekly menus (an explicit action is
+always required - see "Phase 10" below), a general file-storage platform,
+biometric/QR meal attendance, or a food-specific revenue dashboard beyond
+the minimal Super Admin overview (see "Phase 10" below).
 
 ## Tech stack
 
@@ -219,13 +264,17 @@ src/
     ├── subscription-payments/  # SubscriptionPayment orders/verification - the owner paying the platform
     ├── audit-log/            # AuditLogService - the one place a sensitive admin action is recorded
     ├── platform-admin/       # Super Admin: organizations/owners/properties/subscriptions/SaaS plans, PlatformAdminGuard
-    └── platform-analytics/   # Database-aggregated platform dashboard/revenue/occupancy/tenant-payment metrics
+    ├── platform-analytics/   # Database-aggregated platform dashboard/revenue/occupancy/tenant-payment metrics
+    ├── complaints/           # Complaint lifecycle, comments, attachments, activity trail; admin read-only view
+    └── food/                 # Food configuration, plans, entitlement, menus, subscriptions, billing, meal consumption
+        ├── controllers/
+        └── services/
 ```
 
-`complaints, food, announcements, notifications` do not exist as modules
-yet - they are added incrementally, one module per phase. Creating empty
-module shells ahead of the code that belongs in them would
-just be structure for its own sake.
+`announcements, notifications` do not exist as modules yet - they are
+added incrementally, one module per phase. Creating empty module shells
+ahead of the code that belongs in them would just be structure for its
+own sake.
 
 ### Key decisions and why
 
@@ -338,8 +387,52 @@ just be structure for its own sake.
   project turns strict mode fully on, since a PG/rent/payments domain has
   enough real nullability (optional email, nullable `endDate`, ...) that
   loose null checking would hide real bugs.
+- **A user-independent subscription-access check, added alongside the
+  existing OWNER-facing one, not in place of it.** Phase 7's
+  `isAccessBlocked` requires an `OrganizationMembership` row, which a
+  complaint-reporting tenant never has (the same "tenant is connected to
+  an organization only through `Residency`, not membership" fact Phase 6
+  already hit for payments). Rather than bend `isAccessBlocked` to fit a
+  caller shape it was never designed for, Phase 9 adds
+  `isOrganizationWriteBlocked(organizationId)` - no `user` parameter,
+  callers must already have authorized the caller's relationship to the
+  organization themselves - and keeps `isAccessBlocked` unchanged so
+  Phase 7's own behavior never shifts. See "Phase 9" below for the full
+  policy this new method implements (a strict superset: `SUSPENDED` *and*
+  `CANCELLED` block, versus `isAccessBlocked`'s `SUSPENDED`-only check).
+- **Three financial domains, three sets of tables, never merged.** Rent
+  (Phase 5/6), SaaS (Phase 7), and now food (Phase 10) each have their own
+  invoice/payment models and their own money-movement rules - a food
+  subscription payment is never added to `PaymentsService`'s tenant-rent
+  totals, never creates a `PaymentAllocation`/`OwnerSettlement`, and never
+  reuses `SubscriptionPayment`. Phase 10 reuses only what is genuinely
+  shared across all three: the `PAYMENT_GATEWAY` Razorpay abstraction
+  (`PaymentGatewayModule`) and the `WebhookEvent` idempotency table -
+  never a domain-specific model. See "Phase 10" below for the full
+  reasoning and the real-Postgres proof that a food payment never appears
+  in a Phase 6 rent-volume query.
+- **A property-scoped configuration, lazily provisioned like a
+  subscription.** `FoodConfiguration` follows the exact lazy-create
+  pattern `OrganizationSubscription` established in Phase 7
+  (`ensureSubscriptionExists`/`getOrCreate`) - there is no separate
+  "enable food for this property" creation endpoint; the first read or
+  write for a property that has never configured food gets a
+  disabled-by-default row, created once and re-read afterward (with the
+  same unique-violation-then-re-read race handling for two concurrent
+  first accesses).
+- **A menu stays editable after publishing - live edits, not
+  unpublish-then-republish.** The obvious first design (items frozen once
+  a menu is `PUBLISHED`, matching how `ComplaintComment`/`RentPlan` freeze
+  history) turned out to be wrong for this domain: the spec's mandatory
+  "live menu update" requirement is that changing *today's already-
+  published* lunch and doing nothing else must reach the tenant dashboard
+  on its very next fetch. `FoodMenusService.assertEditable` therefore
+  allows edits on `DRAFT` **and** `PUBLISHED` menus, blocking only
+  `CANCELLED` - a correction made while implementing this phase, not the
+  original plan, after re-reading the spec's own worked example (Monday
+  Lunch: Paneer -> Chole, visible immediately, no republish step).
 
-## Data model (Phase 0 through Phase 8)
+## Data model (Phase 0 through Phase 10)
 
 ```
 Organization (status: ACTIVE | INACTIVE | SUSPENDED)
@@ -549,6 +642,91 @@ User ──< AuditLog                (Phase 8: actorUserId - always a SUPER_ADMI
   organization-scoped (e.g. a `SaasPlan` change affects no single
   organization). Every write goes through `AuditLogService.record` -
   there is no endpoint that accepts a client-submitted audit entry.
+- `Complaint` denormalizes `tenantId` alongside `residencyId` (mirroring
+  Phase 6's `Payment` denormalization) for query performance and BOLA
+  scoping, and captures `roomId`/`bedId` **at creation time** - these are
+  never re-derived from the tenant's *current* residency later, since a
+  tenant may move rooms/beds or check out entirely after reporting an
+  issue, and the complaint must still describe where the problem actually
+  was. `roomId`/`bedId` are nullable with `onDelete: SetNull` (a deleted
+  room/bed must not cascade-delete the complaint history describing it);
+  every other Complaint foreign key (`organizationId`, `propertyId`,
+  `residencyId`, `tenantId`) is `onDelete: Cascade`, matching the rest of
+  this schema's "history belongs to its parent" convention.
+- `Complaint.reportedByUserId`/`assignedToUserId` are `onDelete:
+  Restrict`/`onDelete: SetNull` respectively - a user who has ever
+  reported a complaint can never be hard-deleted out from under that
+  history, while an assignee leaving simply clears the assignment.
+- `ComplaintActivity` is the only place a status/priority/assignment
+  change is ever recorded, written from inside the same transaction as
+  the mutation it describes (spec: "do not allow clients to directly
+  create arbitrary activity records"). It deliberately never stores a
+  comment's body text, even for a `COMMENT_ADDED` entry - that is what
+  makes the activity feed safe to show to *every* legitimate viewer,
+  including the reporting tenant, without needing to separately enforce
+  `ComplaintComment`'s own `PUBLIC`/`INTERNAL` visibility on it.
+- `ComplaintComment.visibility` (`PUBLIC | INTERNAL`) is enforced entirely
+  in `ComplaintCommentsService`, never left to the client: a tenant
+  requesting `INTERNAL` is rejected server-side
+  (`COMPLAINT_INTERNAL_COMMENT_FORBIDDEN`), never silently downgraded to
+  `PUBLIC`.
+- `ComplaintAttachment` is a minimal reference model (`url`, `fileName`,
+  `mimeType`, `size`) - there is no file-storage/upload endpoint in this
+  phase (spec: "do not build a general file-storage platform"); a client
+  uploads to its own storage first and posts the resulting URL, which
+  this service re-validates server-side (`ALLOWED_MIME_TYPES`,
+  `MAX_SIZE_BYTES`) as defense-in-depth against a client-side check that
+  was bypassed or lied about.
+- Indexes on `Complaint` are shaped around the query patterns every role
+  actually needs: `(organizationId, status)` and `(organizationId,
+  createdAt)` for staff triage/listing, `(tenantId, createdAt)` for a
+  tenant's own history, `(assignedToUserId, status)` for "my open work,"
+  plus single-column indexes on `status`/`priority`/`category` for
+  filtering.
+- `FoodConfiguration` is `@unique` on `propertyId` - one row per property,
+  lazily provisioned (disabled by default) on first access, the same
+  lazy-create convention `OrganizationSubscription` uses. `mealsIncludedInRent`
+  and `optionalSubscriptionEnabled` are independent booleans, not a single
+  enum - the spec's Model A/B/C/D configurations are just every
+  combination of these two flags, never a fourth field encoding "which
+  model."
+- `FoodPlan.price`/`currency`/`billingCycle`/`mealTypes` are set once at
+  creation and never mutated - `UpdateFoodPlanDto` has no `price` field at
+  all, enforced at the DTO boundary (`forbidNonWhitelisted`), the same
+  "new row, not an edit" convention `SaasPlan`/`RentPlan` already
+  established. `status` follows `ACTIVE -> ARCHIVED`; an archived plan is
+  never deleted because historical `TenantFoodSubscription` rows still
+  reference it.
+- `TenantFoodSubscription.priceSnapshot`/`currency`/`mealTypesSnapshot`
+  freeze what the tenant actually agreed to at subscribe time - a later
+  `FoodPlan.price`/`mealTypes` change never alters an existing
+  subscriber's terms or any already-issued invoice's amount, proven
+  against real Postgres (see "Testing strategy" below). At most one
+  `ACTIVE` subscription per residency is enforced by a hand-written
+  partial unique index (`food_subscriptions_active_residency_unique`,
+  `WHERE status = 'ACTIVE'`) - Prisma's schema DSL cannot express a
+  partial index, the same limitation already documented for
+  `BedAllocation`/`RentPlan`.
+- `FoodSubscriptionInvoice`/`FoodSubscriptionPayment` are deliberately
+  separate tables from every other invoice/payment model in this
+  schema - never Phase 5's `Invoice`, Phase 6's `Payment`, or Phase 7's
+  `SubscriptionInvoice`/`SubscriptionPayment` (spec: "keep food financial
+  records separate"). `FoodSubscriptionPayment` carries no
+  `platformFee`/`ownerSettlementAmount` field at all - there is no
+  platform/owner split for food, the organization keeps everything a
+  tenant pays for it, mirroring why `SubscriptionPayment` (Phase 7) has
+  no such field either.
+- `Menu` is a date-specific row (`@@unique([propertyId, date])`), never a
+  single mutable "current menu" table - editing one date's `MenuItem`
+  rows can never affect any other date's, and a menu's own `status`
+  (`DRAFT -> PUBLISHED -> CANCELLED`, or `DRAFT/PUBLISHED -> CANCELLED`)
+  gates tenant visibility without ever rewriting history.
+- `MealConsumption.itemNamesSnapshot` freezes what was actually served at
+  the moment of marking - a later edit to that day's `MenuItem` rows can
+  never rewrite what a resident is recorded as having eaten.
+  `@@unique([residencyId, mealDate, mealType])` prevents a duplicate
+  consumption record for the same meal period at the database level, not
+  just an application-level check.
 
 ## Roles
 
@@ -812,6 +990,157 @@ stays at a PG.
   exactly one call succeeded and the other correctly received
   `ORGANIZATION_ALREADY_SUSPENDED`, with a single deterministic final
   `SUSPENDED` state.
+- From Phase 9: `complaints.service.spec.ts` (server-derived identity
+  fields, the tenant-supplied-`URGENT`-capped-to-`HIGH` rule, room/bed
+  resolution - explicit, validated, or derived from the active
+  `BedAllocation` - the BOLA-safe `getAccessibleComplaintOrThrow`/
+  `getOrgComplaintForActionOrThrow` split, and query scoping for
+  tenant/org-member/SUPER_ADMIN/neither), `complaint-lifecycle.service
+  .spec.ts` (every transition's role/status precondition, assignee-
+  organization-membership validation, STAFF's self-assignment-only rule
+  for start/resolve, and - critically - the atomic `updateMany`'s
+  `count === 0` path translating a lost race into the same
+  `COMPLAINT_INVALID_STATUS_TRANSITION` a sequential duplicate call would
+  see), `complaint-comments.service.spec.ts` (PUBLIC/INTERNAL creation
+  and read-side filtering for a tenant vs. an organization member),
+  `complaint-attachments.service.spec.ts` (MIME/size re-validation,
+  uploader-or-OWNER/MANAGER deletion rule), and `complaint-activity
+  .service.spec.ts` (writes only via the given transaction client, never
+  populates a comment body). 45 new unit tests, all passing; full suite
+  351/351.
+- `test/phase9-complaints.e2e-spec.ts` (31 tests) exercises the full HTTP
+  surface: complaint creation with server-derived identity and priority
+  capping, organization/tenant-scoped listing, the full BOLA/IDOR matrix
+  (cross-tenant read rejected, cross-organization read and write
+  rejected with **no mutation**, cross-organization assignee rejected,
+  an unrelated outsider rejected), the complete lifecycle chain (assign
+  -> start -> priority change -> resolve -> close, plus tenant
+  self-cancel and every role-restriction branch), PUBLIC/INTERNAL comment
+  visibility from both sides, the activity trail's audience and content,
+  `GET /admin/complaints` SUPER_ADMIN-only platform visibility (reusing
+  `ComplaintsService` directly, confirming no parallel query logic was
+  needed), and the `SUBSCRIPTION_SUSPENDED` gate itself - a `SUSPENDED`
+  subscription blocking a tenant's complaint creation, and a SUPER_ADMIN
+  read remaining reachable regardless of subscription state.
+- All five of the spec's mandatory real-Postgres scenarios were run
+  directly against the live database with a one-off script, using the
+  real Nest DI graph (`NestFactory.createApplicationContext`) rather than
+  reimplemented logic, so every check exercised the actual production
+  services: (1) cross-tenant isolation - Tenant B's
+  `getAccessibleComplaintOrThrow` call against Tenant A's complaint
+  correctly threw `COMPLAINT_NOT_FOUND`; (2) cross-organization
+  assignment - an Org B manager's `assign` call against an Org A
+  complaint was rejected with `COMPLAINT_NOT_FOUND` and left the
+  complaint's `status`/`assignedToUserId` completely untouched; (3)
+  concurrent assignment - two managers assigning the same `OPEN`
+  complaint to two different staff members simultaneously both resolved
+  without deadlock or crash (re-assigning an already-`ASSIGNED` complaint
+  is allowed by design, so both succeeded sequentially at the database
+  level), leaving one deterministic final assignee and exactly one
+  `ASSIGNED` activity per successful call; (4) concurrent status
+  transition - two simultaneous `IN_PROGRESS -> RESOLVED` calls for the
+  same complaint resolved to **exactly one** success and one clean
+  `COMPLAINT_INVALID_STATUS_TRANSITION` rejection, with exactly one
+  `RESOLVED` activity row recorded - proving the atomic
+  `updateMany`-with-expected-prior-status pattern holds under a genuine
+  race, not just sequential calls; (5) subscription access - a fresh
+  `TRIAL` subscription did not block writes, a `SUSPENDED` subscription
+  blocked a tenant's complaint creation with `SUBSCRIPTION_SUSPENDED`, a
+  `SUPER_ADMIN` caller bypassed the gate entirely (failing instead on the
+  unrelated `TENANT_NOT_FOUND`, proving the subscription check is never
+  even reached), and a `CANCELLED` subscription also blocked writes,
+  confirming Phase 9's policy is a genuine superset of Phase 7's
+  `SUSPENDED`-only check. 15/15 assertions passed; the script and its
+  seeded data were deleted after the run, per this project's convention.
+- From Phase 10: `food-configuration.service.spec.ts` (lazy provisioning,
+  the concurrent-first-access re-read path, OWNER/MANAGER-only updates),
+  `food-plans.service.spec.ts` (Decimal price handling, `price` never
+  reaching an `update` call even when present on the DTO object, archive/
+  already-archived, BOLA via `listActiveOrganizationIds`),
+  `food-entitlement.service.spec.ts` (Models A/B/C, the
+  never-duplicate-a-meal-type dedup rule, `TENANT_NOT_FOUND`/
+  `RESIDENCY_NOT_FOUND` context resolution), `food-subscriptions.service
+  .spec.ts` (subscribe validation chain - config/plan-status/existing-
+  active checks - the unique-violation-to-`FOOD_SUBSCRIPTION_ALREADY_ACTIVE`
+  translation, pause/resume/cancel's atomic `updateMany` transitions, BOLA,
+  and `cancelForCheckout`'s no-op-when-nothing-active safety),
+  `food-billing.service.spec.ts` (invoice generation snapshotting
+  `priceSnapshot` never a live plan re-read, `evaluateRenewal`'s three
+  branches, and `finalizeCapturedPayment`'s idempotency across an
+  already-`CAPTURED` payment and an already-`PAID`/`VOID` invoice - the
+  same critical-transaction shape Phase 6/7 already established),
+  `food-menus.service.spec.ts` (duplicate-menu unique-violation
+  translation, atomic publish/cancel, DRAFT-and-PUBLISHED-but-not-
+  CANCELLED editability, `putWeek`'s one-transaction bulk upsert, BOLA),
+  and `meal-consumption.service.spec.ts` (item-name snapshotting,
+  duplicate-consumption unique-violation translation). Every mutating
+  service's spec also asserts its `AuditLogService.record` call shape on
+  success and that no audit row is written on an authorization/state
+  failure (the follow-up that closed Phase 10's own audit gap - see
+  "Administrative audit logging" above). 54 new unit tests, all passing;
+  full suite 405/405.
+- `test/phase10-food.e2e-spec.ts` (33 tests) exercises the full HTTP
+  surface across all three models: Model A (meals included in rent - no
+  subscription/invoice ever created, STAFF blocked from configuration
+  writes), Model B/C (subscribe -> ISSUED invoice, entitlement dedup,
+  pause/resume/cancel), the full menu lifecycle (DRAFT invisible to
+  tenants, publish makes it visible on the very next tenant fetch, a live
+  edit to an already-published day propagates without a republish step,
+  weekly bulk PUT, STAFF blocked from publishing), the complete BOLA/IDOR
+  matrix (cross-organization menu read/publish rejected with **no
+  mutation**, cross-property configuration access rejected, an outsider
+  with no residency correctly getting `RESIDENCY_NOT_FOUND`), residency
+  checkout expiring an active food subscription end-to-end through the
+  real `ResidenciesService.checkOut` hook, the reused `SUBSCRIPTION_SUSPENDED`
+  gate, meal consumption marking and duplicate rejection,
+  `GET /admin/food/overview` SUPER_ADMIN-only visibility, and a dedicated
+  "Food administrative audit logging" block: a full `FOOD_PLAN_CREATED`
+  row's shape (actor/organization/entityType/entityId/metadata/createdAt),
+  the expected `FOOD_MENU_CREATED -> PUBLISHED -> UPDATED -> CANCELLED`
+  action sequence for one menu, a cross-organization plan update rejected
+  with zero audit rows, a tenant's publish/configure/update attempts all
+  rejected with zero administrative audit rows, and a SUPER_ADMIN read
+  writing no audit row at all.
+- All of the spec's mandatory real-Postgres scenarios were run directly
+  against the live database with a one-off script, using the real Nest DI
+  graph (`NestFactory.createApplicationContext`) exactly like Phase 9's
+  own verification: (1) Model A never creates a subscription/invoice; (2)
+  a `FoodPlan` price/subsequent-plan change never alters an
+  already-issued `FoodSubscriptionInvoice`'s `total` (still `2500`, not
+  `3000`, after archiving the old plan and creating a new one at a higher
+  price); (3) cross-organization menu read/publish rejected with no
+  mutation, and a foreign subscription id never resolves; (4) concurrent
+  subscription creation for the same residency - two simultaneous
+  `subscribe` calls resolved to **exactly one** success and one clean
+  `FOOD_SUBSCRIPTION_ALREADY_ACTIVE` rejection, with exactly one `ACTIVE`
+  row afterward - proving the partial unique index
+  (`food_subscriptions_active_residency_unique`) holds under a genuine
+  race; (5) concurrent menu creation for the same property/date -
+  resolved to exactly one success, one `MENU_ALREADY_EXISTS` rejection,
+  and exactly one row; (6) concurrent duplicate meal-consumption marking -
+  resolved to exactly one success and exactly one row, proving the
+  `meal_consumption_unique` constraint holds under a genuine race; (7)
+  checkout (through the real `ResidenciesService.checkOut`, not a direct
+  service call) expired the active subscription while the historical
+  invoice remained intact; (8) financial isolation - subscribing to food
+  created zero Phase 6 `Payment`/`OwnerSettlement` rows; (9) the
+  subscription-access policy - `SUSPENDED` blocked a food subscribe
+  attempt, confirmed via both the thrown error and a direct
+  `isOrganizationWriteBlocked` check. 25/25 assertions passed; the script
+  and its seeded data were deleted after the run.
+- A dedicated follow-up real-Postgres script verified the audit-logging
+  gap closure specifically: (1) `FOOD_CONFIGURATION_UPDATED` written with
+  the authenticated OWNER as `actorUserId` (never client-supplied) and
+  `organizationId` resolved from the property, never trusted from the
+  request; (2) a `FoodPlan`'s create -> update -> archive produced exactly
+  the `FOOD_PLAN_CREATED, FOOD_PLAN_UPDATED, FOOD_PLAN_ARCHIVED` row
+  sequence, in order; (3) a cross-organization plan update was rejected
+  with `404 FOOD_PLAN_NOT_FOUND` and wrote **zero** `FOOD_PLAN_UPDATED`
+  rows; (4) `FOOD_MENU_PUBLISHED`'s metadata carried the correct date, and
+  `FOOD_SUBSCRIPTION_CREATED`'s `actorUserId` was the subscribing tenant
+  themselves with `organizationId` resolved from their own residency
+  context. 12/12 assertions passed; the script and its seeded data were
+  deleted after the run.
 
 ## Environment variables
 
@@ -2521,16 +2850,523 @@ distinct concurrency pattern from every prior phase's (a conditional
   snapshots the price it was billed at) plus each `SaasPlan`'s own
   `effectiveFrom`/`effectiveTo`, but there is no dedicated "plan version"
   join table linking them explicitly.
-- **`SubscriptionAccessGuard` (Phase 7) remains unwired** - genuinely
-  different from Phase 8's organization-level suspension (see above,
-  which *is* fully wired via the pre-existing `MembershipsService`
-  chokepoint); Phase 7's subscription-suspension access policy is still
-  a standalone, unit-tested but unapplied guard, unchanged by this phase.
+- **`SubscriptionAccessGuard` (Phase 7) remains unwired as a guard** -
+  genuinely different from Phase 8's organization-level suspension (see
+  above, which *is* fully wired via the pre-existing `MembershipsService`
+  chokepoint). **Resolved for the complaints domain in Phase 9** (see
+  "Phase 9" below): rather than force-fit the existing guard/
+  `isAccessBlocked` shape onto a tenant caller (who has no
+  `OrganizationMembership` row to check), Phase 9 adds a new,
+  user-independent `isOrganizationWriteBlocked(organizationId)` method
+  and calls it directly from `ComplaintsService`/
+  `ComplaintLifecycleService`/`ComplaintCommentsService`/
+  `ComplaintAttachmentsService`. Phase 0-6's other write endpoints
+  (properties, rooms, beds, residencies, rent plans, invoices, tenant
+  payments) still do not check subscription state at all - extending this
+  same pattern to them remains future work, not a Phase 9 deliverable.
 - **No owner SaaS-subscription-suspension override for a Super Admin** -
   a Super Admin can suspend/activate at the *organization* level, but
   there is no admin action to manually force an `OrganizationSubscription`
   out of `SUSPENDED`/`GRACE_PERIOD` (e.g. a goodwill extension) - only a
   real payment moves that state machine.
+
+## Phase 9: complaints & maintenance
+
+### Reused entities, one new domain
+
+A complaint is reported against an existing `Residency` at an existing
+`Property`/`Room`/`Bed` - Phase 9 introduces no parallel tenant, property,
+or room concept of its own (spec: "do NOT duplicate tenant, property, or
+room models"). `Complaint.organizationId`/`propertyId`/`residencyId`/
+`tenantId`/`roomId`/`bedId`/`reportedByUserId` are **all derived from the
+authenticated caller's own current residency**, never accepted from the
+client - `CreateComplaintDto` has no field for any of them, and the
+global `ValidationPipe`'s `forbidNonWhitelisted` would reject the request
+outright if it tried.
+
+### Why residency context is captured, not re-derived
+
+`Complaint.roomId`/`bedId` are snapshotted **at creation time**. A tenant
+can move rooms, change beds, or check out entirely after reporting an
+issue - re-deriving "where was this?" from the tenant's *current*
+residency later would silently rewrite history and could even point a
+resolved complaint at a room the tenant never actually occupied when the
+problem happened. `resolveRoomAndBed` (in `ComplaintsService.create`)
+validates any client-supplied `roomId`/`bedId` against the property (or
+room), and falls back to the tenant's active `BedAllocation` under that
+residency when neither is supplied - but once the row is written, nothing
+in this domain ever updates it from a later residency/allocation change.
+
+### Lifecycle: explicit actions, never a generic PATCH
+
+```
+OPEN --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close--> CLOSED
+ |                  |
+ +--cancel--> CANCELLED   (OPEN only, by the reporting tenant or OWNER/MANAGER)
+                 |
+                 +--unassign--> OPEN
+```
+
+Every transition is its own `POST /complaints/:id/{assign|unassign|
+priority|start|resolve|close|cancel}` action method, matching this
+project's existing "action-based lifecycle" convention (Phase 4's
+check-in/check-out, Phase 7's cancel/change-plan) - there is no
+`PATCH /complaints/:id { status }` anywhere in this domain (spec: "do NOT
+use unrestricted PATCH for lifecycle state"). `assign` also transitions
+`OPEN -> ASSIGNED` in the same call (the spec's own lifecycle diagram
+folds these into one step); re-assigning an already-`ASSIGNED` complaint
+to someone else is allowed (status stays `ASSIGNED`), but once work has
+actually started (`IN_PROGRESS` or later) the assignee is fixed for the
+rest of this phase's simple workflow.
+
+Every transition uses the same atomic-conditional-`updateMany` pattern
+Phase 8 had to introduce after its own find-then-write race (see "Key
+decisions" above): the expected prior status is folded into the `WHERE`
+clause, so the transition itself - not a separate check-then-write - is
+the atomic, database-enforced unit. Two concurrent callers can both pass
+the authorization/role checks (those don't mutate anything), but only one
+`updateMany` call ever matches a row; the loser's `count === 0` is
+translated into the same `COMPLAINT_INVALID_STATUS_TRANSITION` a
+sequential duplicate call would see - confirmed against real Postgres,
+see "Testing strategy" above.
+
+### Categories, priority, and the URGENT cap
+
+`ComplaintCategory` (`PLUMBING | ELECTRICAL | WIFI | CLEANING | ROOM |
+BED | FURNITURE | FOOD | SECURITY | MAINTENANCE | OTHER`) is
+tenant-chosen at creation and never changed afterward - it describes what
+the problem *is*, not its current handling state. `ComplaintPriority`
+(`LOW | MEDIUM | HIGH | URGENT`) is different: a tenant's own suggested
+priority is never trusted at face value - `ComplaintsService.create`
+silently caps a tenant-supplied `URGENT` down to `HIGH`. Only
+`OWNER`/`MANAGER`, via the dedicated `POST /complaints/:id/priority`
+action after triage, can actually set `URGENT`. This is the same
+"clients propose, the server decides anything consequential" posture as
+Phase 5/6's server-calculated amounts.
+
+### Assignment validation
+
+`assign` (`OWNER`/`MANAGER` only) checks that `assignedToUserId` is an
+**active** `OrganizationMembership` of the *same organization* with a
+role in `OWNER | MANAGER | STAFF` (`ORG_COMPLAINT_ROLES`) - never a
+`STUDENT`, never a member of a different organization, never an inactive
+membership. Assigning cross-organization fails with the ordinary BOLA
+404 (`COMPLAINT_NOT_FOUND`, since the caller isn't a member of the
+complaint's own organization); assigning to a valid member of the
+*wrong* role, or to someone outside the organization entirely, fails
+with `409 COMPLAINT_ASSIGNEE_NOT_IN_ORGANIZATION` /
+`COMPLAINT_ASSIGNMENT_NOT_ALLOWED` - a deliberately different status code
+from the BOLA 404, since here the caller *does* have legitimate access to
+the complaint, they just named an invalid assignee. `start`/`resolve`
+additionally scope `STAFF` to complaints assigned to themselves
+(`getComplaintForStaffActionOrThrow`) - `OWNER`/`MANAGER` may act on any
+complaint in their organization regardless of assignee.
+
+### Authorization matrix
+
+| Action | TENANT (own residency) | STAFF | MANAGER | OWNER | SUPER_ADMIN |
+| --- | --- | --- | --- | --- | --- |
+| Create | yes | - | - | - | no (no tenant profile) |
+| Read own/org complaints | own only | org | org | org | platform-wide |
+| Assign/unassign/priority | no | no | yes | yes | no |
+| Start/resolve (assigned to self) | no | yes | yes | yes | no |
+| Close | no | no | yes | yes | no |
+| Cancel (OPEN only) | own only | no | yes | yes | no |
+| PUBLIC comment | yes | yes | yes | yes | yes |
+| INTERNAL comment | no | yes | yes | yes | yes |
+| Activity trail | own/org (same as read) | org | org | org | platform-wide |
+
+`SUPER_ADMIN` is deliberately **read-only** here (spec: "Super Admin is
+primarily global visibility/oversight... do not give Super Admin
+arbitrary database mutation") - `AdminComplaintsController` exposes only
+`GET /admin/complaints` and `GET /admin/complaints/:id`, both reusing
+`ComplaintsService.findMany`/`findOne` exactly as they already behave for
+a `SUPER_ADMIN` caller, rather than a parallel query path.
+`getOrgComplaintForActionOrThrow` (the write-side BOLA lookup) has no
+`SUPER_ADMIN` bypass at all, unlike the read-side
+`getAccessibleComplaintOrThrow` - a `SUPER_ADMIN` attempting a lifecycle
+action gets the same `404 COMPLAINT_NOT_FOUND` a genuine outsider would.
+
+### BOLA/IDOR: the same fetch-then-branch pattern, twice
+
+Complaint access has two structurally different legitimate viewer types -
+the reporting tenant, and any active member of the owning organization -
+the same shape `TenantsService.findOne` (Phase 4) and `PaymentsService`
+(Phase 6) already established: fetch the row by id alone, then branch on
+the caller's relationship to it, never try to express both access paths
+in one `WHERE` clause. Two variants exist because read and write
+authorization genuinely differ here:
+`getAccessibleComplaintOrThrow` (read: tenant OR org member OR
+`SUPER_ADMIN`) and `getOrgComplaintForActionOrThrow` (write: org member
+with an allowed role only - never the tenant, never `SUPER_ADMIN`). Every
+lookup returns the identical `404 COMPLAINT_NOT_FOUND` whether the
+complaint doesn't exist or the caller simply has no legitimate
+relationship to it - confirmed for cross-tenant, cross-organization read,
+and cross-organization write (with a follow-up assertion that the
+attempted write caused **no mutation**) in both
+`test/phase9-complaints.e2e-spec.ts` and the real-Postgres verification
+script.
+
+### Comments: PUBLIC vs INTERNAL
+
+`ComplaintComment.visibility` is enforced entirely in
+`ComplaintCommentsService`, on both the write and read path - never
+mixed into `ComplaintResponseDto` itself, and never left to the client to
+self-police. A tenant may create only `PUBLIC` comments (`INTERNAL`
+throws `COMPLAINT_INTERNAL_COMMENT_FORBIDDEN`); `OWNER`/`MANAGER`/`STAFF`/
+`SUPER_ADMIN` may create either. On read, `findForComplaint` filters to
+`visibility: 'PUBLIC'` only when the caller *is* the reporting tenant -
+every other legitimate viewer (org member, `SUPER_ADMIN`) sees both.
+
+### Activity trail: immutable, server-only, comment-body-free
+
+`ComplaintActivityService.record` is the only place a
+`ComplaintActivity` row is ever created, called from inside the same
+transaction as the mutation it describes by
+`ComplaintsService`/`ComplaintLifecycleService`/`ComplaintCommentsService`
+- there is no endpoint that accepts a client-submitted activity entry.
+It deliberately never populates the `comment` column with an actual
+comment's body text, even for a `COMMENT_ADDED` entry - that is precisely
+what lets `GET /complaints/:id/activity` be shown to *every* legitimate
+complaint viewer, including the reporting tenant, without needing to
+separately re-enforce `PUBLIC`/`INTERNAL` visibility on it the way
+`ComplaintCommentsService` must for actual comments.
+
+### Attachments: a reference model, not a file-storage platform
+
+`ComplaintAttachment` stores only `url`/`fileName`/`mimeType`/`size` -
+this phase does not build file upload/storage (spec: "do not build a
+general-purpose file-storage platform"). A client is expected to upload
+to its own storage first and post the resulting URL here, which
+`ComplaintAttachmentsService.create` re-validates server-side against
+`ALLOWED_MIME_TYPES`/`MAX_SIZE_BYTES` as defense-in-depth - a
+client-side check having already run is never trusted alone. Deletion is
+restricted to the uploader themselves, or `OWNER`/`MANAGER` of the owning
+organization, or `SUPER_ADMIN`.
+
+### Subscription access: the resolved policy, and exactly where it's wired
+
+Phase 8 flagged `SubscriptionAccessGuard` as unwired because the existing
+`isAccessBlocked` requires an `OrganizationMembership` row -a complaint-
+reporting tenant has none (the same gap Phase 6 already hit for tenant
+rent payments). Rather than guess past this, Phase 9 documents and
+implements the policy explicitly:
+
+```
+TRIAL | ACTIVE | RENEWAL_DUE | GRACE_PERIOD  -- fully operational, no gate
+SUSPENDED | CANCELLED                        -- normal writes blocked
+SUPER_ADMIN                                  -- always bypasses
+```
+
+`SubscriptionsService.isOrganizationWriteBlocked(organizationId)` - no
+`user` parameter - implements this and is called directly (never through
+a guard/decorator) from every complaint-creating/mutating path:
+`ComplaintsService.create`, and via
+`ComplaintsService.assertOrganizationWritableOrThrow` from
+`ComplaintLifecycleService`'s every transition,
+`ComplaintCommentsService.create`, and
+`ComplaintAttachmentsService.create` - always skipped for `SUPER_ADMIN`.
+Read endpoints (`GET /complaints`, `GET /complaints/:id`, `GET
+/complaints/:id/activity`, `GET /complaints/:id/comments`) are never
+gated - a tenant/owner can still see what happened during a suspension,
+they just cannot create new activity. This is a strict superset of the
+pre-existing `isAccessBlocked` (`SUSPENDED`-only, kept unchanged to avoid
+altering Phase 7's own behavior) - `CANCELLED` additionally blocks here
+because a cancelled subscription has no recovery path back to `ACTIVE` at
+all (Phase 7's lifecycle), so there is no "let them keep working while
+they fix billing" case to preserve for it, unlike `SUSPENDED`. Both the
+`SUSPENDED` block and the `CANCELLED` block, plus the `SUPER_ADMIN`
+bypass and a fresh `TRIAL` remaining unblocked, were proven against the
+real running Postgres instance - see "Testing strategy" above.
+
+### Explicitly out of scope / known limitations
+
+- **No SLA/escalation timers** - `Complaint` carries no due-by field and
+  nothing auto-escalates priority or reassigns a stale complaint (spec's
+  own deferral).
+- **No notification delivery** - assignment/status-change/comment events
+  are not pushed anywhere; this phase deliberately keeps every mutation
+  path (`ComplaintsService`/`ComplaintLifecycleService`/
+  `ComplaintCommentsService`) as a clean seam a future Phase 11
+  notification hook could call into, without adding a fake/no-op
+  notification service now.
+- **No complaint reopening** - `CLOSED`/`CANCELLED` are terminal; the
+  spec explicitly deferred a `REOPENED` transition despite the enum
+  already containing the activity type for it.
+- **No general-purpose file-storage platform** - see "Attachments"
+  above; this phase only stores and re-validates a URL reference.
+- **The `SUSPENDED`/`CANCELLED` subscription gate covers only the
+  complaints domain** - Phase 0-6's other write endpoints (properties,
+  rooms, beds, residencies, rent plans, invoices, tenant payments) still
+  perform no subscription check at all. Phase 9's spec scoped the guard
+  resolution to complaints only; extending `isOrganizationWriteBlocked`
+  to those endpoints remains future work.
+
+## Phase 10: food, meals & menu
+
+### Three business models, one entitlement service
+
+A property's food setup is two independent booleans on
+`FoodConfiguration` (`mealsIncludedInRent`, `optionalSubscriptionEnabled`),
+never a single "which model" enum - every combination the spec asks for
+(A: included only, B: subscription only, C: both, D: disabled) falls out
+of these two flags without a special case anywhere in the code.
+`FoodEntitlementService.getEntitlementForResidency` is the one place that
+turns "what does the config say" plus "does this residency have an
+`ACTIVE` `TenantFoodSubscription`" into the tenant-facing answer:
+
+```
+includedMeals      = config.mealsIncludedInRent ? config.includedMealTypes : []
+subscriptionMeals  = activeSubscription
+                        ? activeSubscription.mealTypesSnapshot.filter(m => !includedMeals.includes(m))
+                        : []
+```
+
+The `.filter` is the entire "never duplicate a meal type" rule (spec
+section 16) - a plan that nominally covers `BREAKFAST` again is silently
+excluded from `subscriptionMeals` the moment `BREAKFAST` is already
+rent-included, without the plan or the subscription needing to know
+anything about the property's rent-inclusion setting.
+
+### Model A never creates a subscription
+
+`ComplaintsService`-style server-only derivation applies here too:
+subscribing is the *only* action that creates a `TenantFoodSubscription`/
+`FoodSubscriptionInvoice` pair, and Model A (meals included in rent) never
+calls it - a tenant whose property only offers included meals simply has
+no subscription row, no invoice, no payment, ever. Confirmed against real
+Postgres (see "Testing strategy" above).
+
+### Optional subscription billing: snapshot at subscribe time, bill immediately, renew lazily
+
+Subscribing (`FoodSubscriptionsService.subscribe`) is one authorization/
+validation chain - organization write-access, `FoodConfiguration.enabled`
++ `optionalSubscriptionEnabled`, the plan is `ACTIVE` and belongs to the
+caller's own property, no existing `ACTIVE` subscription for this
+residency - followed by one `create` that snapshots `FoodPlan.price`/
+`currency`/`mealTypes` onto `priceSnapshot`/`currency`/`mealTypesSnapshot`.
+The first billing period's `FoodSubscriptionInvoice` is generated
+**immediately**, in the same call (spec section 65: "Tenant subscribes.
+Verify FoodInvoice = ISSUED") - never deferred to a first lazy read.
+Subsequent months are lazy (`FoodBillingService.evaluateRenewal`, the same
+no-cron-infrastructure convention Phase 5's `evaluateOverdue` and Phase
+7's `evaluateLifecycle` already established): called whenever a caller
+reads their invoices, it generates the next period's invoice only if the
+subscription is still `ACTIVE` and the latest invoice's period has fully
+elapsed - a `PAUSED`/`CANCELLED`/`EXPIRED` subscription never accrues a
+new invoice. A later `FoodPlan.price` change (even via archive-and-recreate)
+never touches an already-issued invoice's `total` - proven against real
+Postgres by changing a plan's price after a tenant subscribed and
+confirming the existing invoice was untouched.
+
+### Payment: a third money flow, isolated by construction
+
+`FoodBillingService`'s `createOrder`/`verifyPayment`/`finalizeCapturedPayment`
+are a near-exact structural copy of Phase 7's `SubscriptionPaymentsService`
+(same idempotency-key handling, same `PAYABLE_INVOICE_STATUSES` gate, same
+"lock the invoice row `FOR UPDATE`, idempotent against either arrival
+order" critical transaction) - deliberately copied rather than shared,
+the same "do NOT reuse Phase 6 Payment for SaaS payments" precedent Phase
+7 itself set. `FoodSubscriptionPayment` has no `platformFee`/
+`ownerSettlementAmount` field and never creates a `PaymentAllocation`/
+`OwnerSettlement` (spec sections 5/46) - the organization keeps 100% of
+what a tenant pays for food. The only genuinely shared pieces are the
+`PAYMENT_GATEWAY` Razorpay abstraction and the `WebhookEvent` idempotency
+table: `PaymentsWebhookService.handleEvent` now dispatches to a *third*
+domain purely by which table's `providerOrderId` matches (tenant-rent
+`Payment`, then SaaS `SubscriptionPayment`, then food
+`FoodSubscriptionPayment`) - one webhook URL, one merchant account, three
+domains, each still knowing nothing about the other two. Confirmed
+against real Postgres that subscribing to food produces zero Phase 6
+`Payment`/`OwnerSettlement` rows (spec section 79).
+
+### Menus: date-specific rows, never a mutable "current menu"
+
+`Menu` is keyed `@@unique([propertyId, date])` - October 1st and October
+2nd are different rows from creation, so editing one can never touch the
+other (spec section 34). The lifecycle is `DRAFT -> PUBLISHED ->
+CANCELLED`; publish/cancel both use the same atomic
+expected-prior-status-in-`WHERE` `updateMany` pattern every lifecycle
+transition in this codebase uses since Phase 8/9, so a lost race
+translates into a clean `MENU_ALREADY_PUBLISHED`/`MENU_CANCELLED`
+conflict, never a silent double-transition. Two concurrent
+"create today's menu" calls for the same property/date resolve to exactly
+one row and one `MENU_ALREADY_EXISTS`, proven against real Postgres via
+the hand-off-the-shelf Prisma `@@unique` constraint (no hand-written
+partial index needed here, unlike `TenantFoodSubscription`).
+
+A design correction made while implementing this phase: the first draft
+made a menu's items immutable once `PUBLISHED`, mirroring how this
+project freezes history everywhere else (`ComplaintComment`, `RentPlan`,
+every `*Invoice`). That turned out to be the wrong model for *menus*
+specifically - the spec's own mandatory "live menu update" scenario is
+that changing today's already-published lunch and doing nothing else must
+reach the tenant dashboard on the very next fetch, with no republish step
+(spec section 32). `FoodMenusService.assertEditable` therefore allows
+edits on `DRAFT` **and** `PUBLISHED` menus - only `CANCELLED` is terminal.
+This is reflected in `test/phase10-food.e2e-spec.ts`'s own "updating
+today's menu... live" test.
+
+### Daily and weekly menu management
+
+`POST /properties/:propertyId/food/menus` creates one day;
+`PUT /properties/:propertyId/food/menus/week` (spec section 27) accepts
+up to 7 date entries and, inside one `$transaction`, creates-or-finds each
+day's `Menu` row and fully replaces its items - so a request meant to
+update a whole week can never leave some days changed and others
+untouched. It never publishes anything (spec section 37/27: "never
+automatically publish") and never auto-repeats a prior week's menu (spec
+section 37) - copying a week (spec section 36, explicitly optional and
+deferred if it adds unnecessary complexity) was not implemented this
+phase; every day's content is entered explicitly.
+
+### Tenant dashboard: the backend is the source of truth
+
+Every `/me/food/*` route (`MyFoodController`) resolves the caller's
+property/residency through `FoodEntitlementService.getCallerResidencyContext`
+(Authenticated User -> Tenant -> Residency -> Property -> Organization,
+the same chain Phase 9's complaint creation already established) - never
+a client-supplied `propertyId`/`tenantId`. `GET /me/food` composes
+`enabled` + `entitlement` + today's published menu (grouped by meal type)
++ the active subscription id into one payload; `GET /me/food/menu` and
+`GET /me/food/menu/week` reuse `FoodMenusService.findOneForDate`/
+`findWeekRows` with `publishedOnly: true`, so a tenant can never see a
+`DRAFT` day regardless of which endpoint they call. There is no client-
+side caching/computation contract at all (spec section 92) - every fetch
+re-resolves from Postgres.
+
+### Authorization matrix
+
+| Action | OWNER | MANAGER | STAFF | TENANT | SUPER_ADMIN |
+| --- | --- | --- | --- | --- | --- |
+| Configure food / create plans / archive plans | yes | yes | no | no | no |
+| Create/edit menus, publish, cancel | yes | yes | no (read-only) | no | no |
+| View configuration/menus/entitlement | yes | yes | yes | own only | platform-wide (read-only) |
+| Mark meal consumption | yes | yes | yes | no | no |
+| Subscribe / pause / resume / cancel own subscription | - | - | - | yes | no |
+| View own subscription/invoices/meal history | - | - | - | yes | - |
+
+`GET /admin/food/overview` is the only Super Admin surface this phase
+adds (spec section 51: "do not create unnecessary platform write
+operations") - a read-only aggregate count, reusing `PlatformAdminGuard`
+exactly as Phase 8/9 already established (404, not 403, for a non-admin
+caller). There is no admin write endpoint for food at all.
+
+### Residency checkout integration
+
+`ResidenciesService.checkOut` calls
+`FoodSubscriptionsService.cancelForCheckout(tx, residencyId)` inside its
+own existing transaction (never a separate best-effort follow-up call) -
+an `ACTIVE`/`PAUSED` subscription becomes `EXPIRED`, a safe no-op when
+none exists. Historical invoices/payments are never touched. This is a
+one-directional module dependency (`ResidenciesModule` imports
+`FoodModule`, never the reverse) added to Phase 4's existing module
+without rewriting any of its own logic (spec section 49/85: "do not
+rewrite Phase 4").
+
+### Administrative audit logging
+
+Food administrative mutations are recorded in the platform-wide `AuditLog`
+(Phase 8) - the same table, the same `AuditLogService.record`, the same
+PascalCase `entityType`/SCREAMING_SNAKE `action` conventions Phase 8's
+`SaasPlan`/`Organization` audit events already established, never a
+second, food-specific audit table. Every write happens in the *service*
+layer, immediately after its own mutation has already succeeded (the same
+placement `PlatformAdminService.suspendOrganization` uses) - an
+authorization failure or a thrown domain error always short-circuits
+before the audit call is ever reached, so a rejected or unauthorized
+request never produces a row (proven for a cross-organization plan update
+and for a tenant's menu-publish/configuration/plan attempts, all 404/403
+with zero audit rows, against both the in-memory e2e suite and real
+Postgres).
+
+Actions recorded:
+
+```
+FOOD_CONFIGURATION_UPDATED     FoodConfiguration
+FOOD_PLAN_CREATED              FoodPlan
+FOOD_PLAN_UPDATED              FoodPlan
+FOOD_PLAN_ARCHIVED             FoodPlan
+FOOD_MENU_CREATED              Menu
+FOOD_MENU_UPDATED              Menu
+FOOD_MENU_PUBLISHED            Menu
+FOOD_MENU_CANCELLED            Menu
+FOOD_SUBSCRIPTION_CREATED      TenantFoodSubscription
+FOOD_SUBSCRIPTION_PAUSED       TenantFoodSubscription
+FOOD_SUBSCRIPTION_RESUMED      TenantFoodSubscription
+FOOD_SUBSCRIPTION_CANCELLED    TenantFoodSubscription
+```
+
+`actorUserId` is always the authenticated caller, never accepted from the
+client; `organizationId` is always resolved from the already-authorized
+resource (the property/plan/menu/subscription itself), never trusted from
+a request body. `metadata` stays small and non-sensitive - an update
+records `changedFields` (the DTO's own non-`undefined` keys) rather than
+the full before/after object, and a menu event records only
+`propertyId`/`date`. Reads (including `GET /admin/food/overview`) are
+never audited - only mutations are, matching Phase 8's own "audit
+sensitive admin *actions*" scope, not "audit every access."
+
+Deliberately **not** audited: `MealConsumption` marking (high-volume
+operational telemetry, not an administrative/security-significant action
+- kept on the existing structured `Logger` instead, the same distinction
+Phase 6/7 already draw between a `Payment`'s own audit-worthy lifecycle
+and routine reads) and the food payment/webhook state machine
+(`FoodBillingService` - Phase 6/7 already have their own financial
+state-transition handling via `Payment`/`SubscriptionPayment`'s own
+status fields and structured logs; this follow-up closes the *food
+administrative* gap specifically, not a payment-auditing redesign). The
+`cancelForCheckout` residency-checkout-triggered `EXPIRED` transition is
+also not separately audited - it is a system-triggered side effect of
+`ResidenciesService.checkOut` (itself only structured-`Logger`-logged,
+predating Phase 8's `AuditLog`, unchanged by this follow-up), not a
+standalone admin action with its own actor to attribute a row to.
+
+### Database indexes and concurrency
+
+Every food table follows this schema's established indexing shape:
+`organizationId`/`propertyId` for scoping, `(tenantId, createdAt)` for a
+tenant's own history, status-filtered composite indexes for the queries
+each role actually runs. Three concurrency invariants are enforced at the
+database layer, not just in application code, and all three were proven
+against a genuine race on real Postgres (see "Testing strategy" above):
+at most one `ACTIVE` food subscription per residency (hand-written
+partial unique index, the same pattern as `BedAllocation`/`RentPlan`), at
+most one menu per property/date (a plain Prisma `@@unique`), and at most
+one meal-consumption record per residency/meal-date/meal-type (a plain
+`@@unique`).
+
+### Explicitly out of scope / known limitations
+
+- **No recurring/templated weekly menus** - every week's content is
+  entered explicitly; the spec itself defers this to a future phase (spec
+  section 37).
+- **No weekly-menu copy** - spec section 36 explicitly allowed deferring
+  this "if implementation becomes unnecessarily complex... rather than
+  compromising the core model"; not implemented this phase.
+- **No general-purpose file-storage platform** - not applicable to this
+  phase's own models, but mentioned for completeness alongside Phase 9's
+  same deferral.
+- **No biometric/QR meal attendance** - `MealConsumption.source` supports
+  `TENANT_MARKED`/`SYSTEM` as enum values for future use, but only
+  `STAFF_MARKED` is implemented this phase (spec section 38).
+- **No food-specific revenue dashboard beyond the minimal admin
+  overview** - `GET /admin/food/overview` returns counts (plans,
+  subscriptions, invoices by status, menus), not a revenue figure; a full
+  food-revenue breakdown mirroring Phase 8's rent/SaaS separation remains
+  future work.
+- **The Razorpay webhook dispatch now checks three tables per event** -
+  functionally correct and proven idempotent, but as a fourth domain is
+  ever added to this webhook URL, `PaymentsWebhookService.handleEvent`'s
+  linear dispatch chain would be worth revisiting for a lookup-table
+  approach instead.
+- **Meal consumption and food payment/webhook state transitions are
+  intentionally not written to `AuditLog`** - see "Administrative audit
+  logging" above for the reasoning (high-volume operational telemetry vs.
+  Phase 6/7's own existing financial state handling, respectively). If a
+  future compliance need requires a durable trail for either, it should
+  reuse `AuditLogService.record` the same way this phase's administrative
+  events do, not a new mechanism.
 
 ## Roadmap
 
@@ -2540,8 +3376,13 @@ foundation → Phase 2 (done): organizations + properties +
 beds → Phase 4 (done): tenants + residency + bed allocation → Phase 5
 (done): rent + invoices → Phase 6 (done): tenant payments + platform fee
 + owner settlement (Razorpay) → Phase 7 (done): owner SaaS subscription
-(plans, recharge, renewal, grace period, suspension) → Phase 8 (this
-repository, done): Super Admin / founder platform management (global
-visibility, organization suspension, SaaS plan management, revenue
-analytics, audit logging) → Phase 9: complaints → Phase 10: food/menu →
-Phase 11: notifications.
+(plans, recharge, renewal, grace period, suspension) → Phase 8 (done):
+Super Admin / founder platform management (global visibility,
+organization suspension, SaaS plan management, revenue analytics, audit
+logging) → Phase 9 (done): complaints & maintenance (lifecycle,
+assignment, PUBLIC/INTERNAL comments, activity trail, attachments,
+resolved subscription-access policy) → Phase 10 (this repository, done):
+food, meals & menu (included-in-rent + optional paid subscription models,
+daily/weekly menu management with a live-update publish lifecycle, tenant
+dashboard, isolated food billing, meal consumption) → Phase 11:
+notifications.

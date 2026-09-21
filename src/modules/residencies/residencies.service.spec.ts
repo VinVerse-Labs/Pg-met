@@ -4,6 +4,7 @@ import { ErrorCode } from '../../common/constants/error-code.enum';
 import { MembershipsService } from '../memberships/memberships.service';
 import { PropertiesService } from '../properties/properties.service';
 import { TenantsService } from '../tenants/tenants.service';
+import { FoodSubscriptionsService } from '../food/services/food-subscriptions.service';
 import { ResidenciesService } from './residencies.service';
 
 function buildUser(
@@ -58,6 +59,7 @@ describe('ResidenciesService', () => {
   };
   let properties: { getAccessiblePropertyOrThrow: jest.Mock };
   let tenants: { assertExists: jest.Mock };
+  let foodSubscriptions: { cancelForCheckout: jest.Mock };
 
   const createDto = {
     tenantId: 'tenant-1',
@@ -87,11 +89,15 @@ describe('ResidenciesService', () => {
     };
     properties = { getAccessiblePropertyOrThrow: jest.fn() };
     tenants = { assertExists: jest.fn() };
+    foodSubscriptions = {
+      cancelForCheckout: jest.fn().mockResolvedValue(undefined),
+    };
     service = new ResidenciesService(
       prisma as any,
       memberships as unknown as MembershipsService,
       properties as unknown as PropertiesService,
       tenants as unknown as TenantsService,
+      foodSubscriptions as unknown as FoodSubscriptionsService,
     );
 
     properties.getAccessiblePropertyOrThrow.mockResolvedValue(

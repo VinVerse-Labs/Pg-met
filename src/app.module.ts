@@ -36,6 +36,8 @@ import { SubscriptionInvoicesModule } from './modules/subscription-invoices/subs
 import { SubscriptionPaymentsModule } from './modules/subscription-payments/subscription-payments.module';
 import { PlatformAdminModule } from './modules/platform-admin/platform-admin.module';
 import { PlatformAnalyticsModule } from './modules/platform-analytics/platform-analytics.module';
+import { ComplaintsModule } from './modules/complaints/complaints.module';
+import { FoodModule } from './modules/food/food.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { RequestIdMiddleware } from './common/middleware/request-id.middleware';
@@ -86,6 +88,8 @@ import { HttpStatus } from '@nestjs/common';
     SubscriptionPaymentsModule,
     PlatformAdminModule,
     PlatformAnalyticsModule,
+    ComplaintsModule,
+    FoodModule,
   ],
   providers: [
     {

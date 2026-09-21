@@ -387,6 +387,16 @@ class FakePrisma {
     },
   };
 
+  // Phase 10: ResidenciesService.checkOut also calls
+  // FoodSubscriptionsService.cancelForCheckout(tx, residencyId) inside its
+  // own transaction - a real service (not mocked here), so it needs a
+  // minimal tenantFoodSubscription stub even though this suite never
+  // creates a food subscription itself; updateMany against an empty map
+  // is always a safe { count: 0 } no-op.
+  tenantFoodSubscription = {
+    updateMany: async () => ({ count: 0 }),
+  };
+
   $transaction = async (fn: (tx: this) => Promise<unknown>) => fn(this);
   $queryRaw = async () => [];
   onModuleInit = jest.fn();

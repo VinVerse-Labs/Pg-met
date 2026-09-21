@@ -6,6 +6,7 @@ import { ErrorCode } from '../../common/constants/error-code.enum';
 import { MembershipsService } from '../memberships/memberships.service';
 import { PropertiesService } from '../properties/properties.service';
 import { TenantsService } from '../tenants/tenants.service';
+import { FoodSubscriptionsService } from '../food/services/food-subscriptions.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { CreateResidencyDto } from './dto/create-residency.dto';
 import { UpdateResidencyDto } from './dto/update-residency.dto';
@@ -38,6 +39,7 @@ export class ResidenciesService {
     private readonly memberships: MembershipsService,
     private readonly properties: PropertiesService,
     private readonly tenants: TenantsService,
+    private readonly foodSubscriptions: FoodSubscriptionsService,
   ) {}
 
   // Creates a residency in PENDING - no bed is allocated here (see spec
@@ -318,6 +320,12 @@ export class ResidenciesService {
         where: { id: residencyId },
         data: { status: 'CHECKED_OUT', actualEndDate: now },
       });
+      // Phase 10 (spec section 49): an active food subscription must not
+      // outlive the residency it belongs to - ends it (EXPIRED) in the
+      // same transaction as checkout, never as a separate best-effort
+      // follow-up call. Historical invoices/payments are untouched (see
+      // FoodSubscriptionsService.cancelForCheckout's own doc comment).
+      await this.foodSubscriptions.cancelForCheckout(tx, residencyId);
       return { allocation, residency: updatedResidency };
     });
 

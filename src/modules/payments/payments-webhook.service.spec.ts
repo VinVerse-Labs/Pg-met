@@ -3,6 +3,7 @@ import { PaymentGateway } from './gateway/payment-gateway.interface';
 import { PaymentsService } from './payments.service';
 import { PaymentsWebhookService } from './payments-webhook.service';
 import { SubscriptionPaymentsService } from '../subscription-payments/subscription-payments.service';
+import { FoodBillingService } from '../food/services/food-billing.service';
 import { ErrorCode } from '../../common/constants/error-code.enum';
 
 function p2002(target: string) {
@@ -37,6 +38,10 @@ describe('PaymentsWebhookService', () => {
     findByProviderOrderId: jest.Mock;
     finalizeCapturedPayment: jest.Mock;
   };
+  let foodBillingService: {
+    findByProviderOrderId: jest.Mock;
+    finalizeCapturedPayment: jest.Mock;
+  };
   let gateway: jest.Mocked<PaymentGateway>;
 
   beforeEach(() => {
@@ -44,9 +49,14 @@ describe('PaymentsWebhookService', () => {
       webhookEvent: { create: jest.fn(), update: jest.fn() },
       payment: { findUnique: jest.fn(), update: jest.fn() },
       subscriptionPayment: { update: jest.fn() },
+      foodSubscriptionPayment: { update: jest.fn() },
     };
     paymentsService = { finalizeCapturedPayment: jest.fn() };
     subscriptionPaymentsService = {
+      findByProviderOrderId: jest.fn().mockResolvedValue(null),
+      finalizeCapturedPayment: jest.fn(),
+    };
+    foodBillingService = {
       findByProviderOrderId: jest.fn().mockResolvedValue(null),
       finalizeCapturedPayment: jest.fn(),
     };
@@ -62,6 +72,7 @@ describe('PaymentsWebhookService', () => {
       prisma,
       paymentsService as unknown as PaymentsService,
       subscriptionPaymentsService as unknown as SubscriptionPaymentsService,
+      foodBillingService as unknown as FoodBillingService,
       gateway,
     );
   });

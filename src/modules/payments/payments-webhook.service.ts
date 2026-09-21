@@ -9,6 +9,7 @@ import {
 } from './gateway/payment-gateway.interface';
 import { PaymentsService } from './payments.service';
 import { SubscriptionPaymentsService } from '../subscription-payments/subscription-payments.service';
+import { FoodBillingService } from '../food/services/food-billing.service';
 
 interface RazorpayWebhookPaymentEntity {
   id?: string;
@@ -38,6 +39,7 @@ export class PaymentsWebhookService {
     private readonly prisma: PrismaService,
     private readonly paymentsService: PaymentsService,
     private readonly subscriptionPaymentsService: SubscriptionPaymentsService,
+    private readonly foodBillingService: FoodBillingService,
     @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
   ) {}
 
@@ -138,6 +140,18 @@ export class PaymentsWebhookService {
       return;
     }
 
+    // Phase 10: the third domain sharing this one webhook URL/merchant
+    // account - dispatched purely by which table's providerOrderId
+    // matches, same as the tenant-rent/SaaS split above. Neither this
+    // service nor FoodBillingService knows about the other two domains.
+    const foodPayment = await this.foodBillingService.findByProviderOrderId(
+      paymentEntity.order_id,
+    );
+    if (foodPayment) {
+      await this.handleFoodPaymentEvent(body, paymentEntity, foodPayment);
+      return;
+    }
+
     // A payment made outside our order-creation flow, or for a payment
     // this instance never created - safe to acknowledge and ignore rather
     // than fail the webhook delivery.
@@ -191,6 +205,34 @@ export class PaymentsWebhookService {
     if (body.event === 'payment.failed') {
       if (payment.status === 'CREATED' || payment.status === 'PENDING') {
         await this.prisma.subscriptionPayment.update({
+          where: { id: payment.id },
+          data: {
+            status: 'FAILED',
+            providerPaymentId: paymentEntity.id,
+            failureCode: paymentEntity.error_code,
+            failureMessage: paymentEntity.error_description,
+          },
+        });
+      }
+    }
+  }
+
+  private async handleFoodPaymentEvent(
+    body: RazorpayWebhookPayload,
+    paymentEntity: RazorpayWebhookPaymentEntity,
+    payment: { id: string; status: string },
+  ): Promise<void> {
+    if (body.event === 'payment.captured') {
+      await this.foodBillingService.finalizeCapturedPayment(
+        payment.id,
+        paymentEntity.id!,
+      );
+      return;
+    }
+
+    if (body.event === 'payment.failed') {
+      if (payment.status === 'CREATED' || payment.status === 'PENDING') {
+        await this.prisma.foodSubscriptionPayment.update({
           where: { id: payment.id },
           data: {
             status: 'FAILED',

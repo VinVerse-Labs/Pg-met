@@ -3,6 +3,7 @@ import { AuthModule } from '../auth/auth.module';
 import { MembershipsModule } from '../memberships/memberships.module';
 import { PaymentGatewayModule } from './gateway/payment-gateway.module';
 import { SubscriptionPaymentsModule } from '../subscription-payments/subscription-payments.module';
+import { FoodModule } from '../food/food.module';
 import { PlatformFeeService } from './platform-fee.service';
 import { PaymentsService } from './payments.service';
 import { PaymentsWebhookService } from './payments-webhook.service';
@@ -22,6 +23,10 @@ import { PaymentsWebhookController } from './payments-webhook.controller';
     // one-directional dependency (SubscriptionPaymentsModule never
     // imports PaymentsModule back).
     SubscriptionPaymentsModule,
+    // Phase 10: the same webhook dispatch reasoning as
+    // SubscriptionPaymentsModule above - FoodModule never imports
+    // anything back from PaymentsModule.
+    FoodModule,
   ],
   controllers: [
     InvoicePaymentsController,
