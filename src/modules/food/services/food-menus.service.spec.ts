@@ -4,6 +4,7 @@ import { ErrorCode } from '../../../common/constants/error-code.enum';
 import { MembershipsService } from '../../memberships/memberships.service';
 import { PropertiesService } from '../../properties/properties.service';
 import { AuditLogService } from '../../audit-log/audit-log.service';
+import { DomainEventBusService } from '../../../common/events/domain-event-bus.service';
 import { FoodMenusService } from './food-menus.service';
 
 function buildUser(
@@ -50,6 +51,7 @@ describe('FoodMenusService', () => {
   };
   let properties: { getAccessiblePropertyOrThrow: jest.Mock };
   let auditLog: { record: jest.Mock };
+  let eventBus: { emit: jest.Mock };
 
   beforeEach(() => {
     prisma = {
@@ -78,11 +80,13 @@ describe('FoodMenusService', () => {
     };
     properties = { getAccessiblePropertyOrThrow: jest.fn() };
     auditLog = { record: jest.fn().mockResolvedValue(undefined) };
+    eventBus = { emit: jest.fn().mockResolvedValue(undefined) };
     service = new FoodMenusService(
       prisma,
       memberships as unknown as MembershipsService,
       properties as unknown as PropertiesService,
       auditLog as unknown as AuditLogService,
+      eventBus as unknown as DomainEventBusService,
     );
     properties.getAccessiblePropertyOrThrow.mockResolvedValue({
       id: 'prop-1',

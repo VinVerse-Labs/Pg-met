@@ -3,6 +3,7 @@ import { ErrorCode } from '../../common/constants/error-code.enum';
 import { MembershipsService } from '../memberships/memberships.service';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import { ComplaintActivityService } from './complaint-activity.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
 import { ComplaintsService } from './complaints.service';
 
 function buildUser(
@@ -28,6 +29,7 @@ describe('ComplaintsService', () => {
   };
   let subscriptions: { isOrganizationWriteBlocked: jest.Mock };
   let activity: { record: jest.Mock };
+  let eventBus: { emit: jest.Mock };
 
   beforeEach(() => {
     prisma = {
@@ -52,12 +54,14 @@ describe('ComplaintsService', () => {
       isOrganizationWriteBlocked: jest.fn().mockResolvedValue(false),
     };
     activity = { record: jest.fn() };
+    eventBus = { emit: jest.fn().mockResolvedValue(undefined) };
 
     service = new ComplaintsService(
       prisma,
       memberships as unknown as MembershipsService,
       subscriptions as unknown as SubscriptionsService,
       activity as unknown as ComplaintActivityService,
+      eventBus as unknown as DomainEventBusService,
     );
   });
 

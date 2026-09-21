@@ -5,6 +5,7 @@ import { MembershipsService } from '../memberships/memberships.service';
 import { PropertiesService } from '../properties/properties.service';
 import { TenantsService } from '../tenants/tenants.service';
 import { FoodSubscriptionsService } from '../food/services/food-subscriptions.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
 import { ResidenciesService } from './residencies.service';
 
 function buildUser(
@@ -60,6 +61,7 @@ describe('ResidenciesService', () => {
   let properties: { getAccessiblePropertyOrThrow: jest.Mock };
   let tenants: { assertExists: jest.Mock };
   let foodSubscriptions: { cancelForCheckout: jest.Mock };
+  let eventBus: { emit: jest.Mock };
 
   const createDto = {
     tenantId: 'tenant-1',
@@ -92,12 +94,14 @@ describe('ResidenciesService', () => {
     foodSubscriptions = {
       cancelForCheckout: jest.fn().mockResolvedValue(undefined),
     };
+    eventBus = { emit: jest.fn().mockResolvedValue(undefined) };
     service = new ResidenciesService(
       prisma as any,
       memberships as unknown as MembershipsService,
       properties as unknown as PropertiesService,
       tenants as unknown as TenantsService,
       foodSubscriptions as unknown as FoodSubscriptionsService,
+      eventBus as unknown as DomainEventBusService,
     );
 
     properties.getAccessiblePropertyOrThrow.mockResolvedValue(

@@ -4,6 +4,7 @@ import { ErrorCode } from '../../common/constants/error-code.enum';
 import { MembershipsService } from '../memberships/memberships.service';
 import { PlatformFeeService } from './platform-fee.service';
 import { PaymentGateway } from './gateway/payment-gateway.interface';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
 import { PaymentsService } from './payments.service';
 
 function buildUser(
@@ -83,6 +84,7 @@ describe('PaymentsService', () => {
   let platformFee: { calculateFee: jest.Mock };
   let gateway: jest.Mocked<PaymentGateway>;
   let configService: { get: jest.Mock };
+  let eventBus: { emit: jest.Mock };
 
   beforeEach(() => {
     prisma = {
@@ -134,10 +136,12 @@ describe('PaymentsService', () => {
         webhookSecret: 'whsec',
       }),
     };
+    eventBus = { emit: jest.fn().mockResolvedValue(undefined) };
     service = new PaymentsService(
       prisma,
       memberships as unknown as MembershipsService,
       platformFee as unknown as PlatformFeeService,
+      eventBus as unknown as DomainEventBusService,
       configService as any,
       gateway,
     );

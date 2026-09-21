@@ -4,6 +4,7 @@ import { ErrorCode } from '../../common/constants/error-code.enum';
 import { MembershipsService } from '../memberships/memberships.service';
 import { PropertiesService } from '../properties/properties.service';
 import { ResidenciesService } from '../residencies/residencies.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
 import { InvoicesService } from './invoices.service';
 
 function buildUser(
@@ -89,6 +90,7 @@ describe('InvoicesService', () => {
   };
   let properties: { getAccessiblePropertyOrThrow: jest.Mock };
   let residencies: { getAccessibleResidencyOrThrow: jest.Mock };
+  let eventBus: { emit: jest.Mock };
 
   beforeEach(() => {
     prisma = {
@@ -108,11 +110,13 @@ describe('InvoicesService', () => {
     };
     properties = { getAccessiblePropertyOrThrow: jest.fn() };
     residencies = { getAccessibleResidencyOrThrow: jest.fn() };
+    eventBus = { emit: jest.fn().mockResolvedValue(undefined) };
     service = new InvoicesService(
       prisma as any,
       memberships as unknown as MembershipsService,
       properties as unknown as PropertiesService,
       residencies as unknown as ResidenciesService,
+      eventBus as unknown as DomainEventBusService,
     );
 
     residencies.getAccessibleResidencyOrThrow.mockResolvedValue(

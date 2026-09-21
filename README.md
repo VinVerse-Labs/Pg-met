@@ -3368,6 +3368,301 @@ one meal-consumption record per residency/meal-date/meal-type (a plain
   reuse `AuditLogService.record` the same way this phase's administrative
   events do, not a new mechanism.
 
+## Phase 11 — Notifications
+
+### Why an in-process event bus, not a queue
+
+The spec's own instruction was to check whether the project already had an
+event mechanism before reaching for one - it did not (no
+`@nestjs/event-emitter`, no Redis/BullMQ, no message broker anywhere in
+this codebase through Phase 10). `DomainEventBusService`
+(`src/common/events/domain-event-bus.service.ts`, `@Global()` via
+`DomainEventBusModule`) is deliberately the smallest thing that could
+work: a typed wrapper around a plain `Map<eventName, listener[]>`, with
+`on()`/`emit()` and nothing else. Every business module that needs to
+notify someone only ever calls `eventBus.emit(NotificationType.X,
+{ entityId })` **after** its own write has already committed (never from
+inside a `$transaction`) - it never imports `NotificationsService` or any
+provider directly. This one-directional dependency (notifications depend
+on business modules' events; no business module depends on notifications)
+means the entire notifications module could be deleted and no business
+module would fail to compile.
+
+### Failure isolation
+
+`DomainEventBusService.emit` catches and logs every listener's exception
+itself - it never rethrows to the caller. This is what makes it
+structurally impossible for a notification failure to fail a rent
+payment, a menu publish, or any other business operation: the business
+service's own `await this.prisma...`/`$transaction(...)` has already
+succeeded by the time `emit` is even called, and whatever happens inside
+`emit` afterward cannot unwind that success. Verified in this phase's own
+e2e runs, where several prior phases' `FakePrisma` fixtures don't define
+every model `NotificationEventService` re-reads (e.g. `residency.findMany`
+for `FOOD_MENU_PUBLISHED`) - those handlers throw
+`DOMAIN_EVENT_HANDLER_FAILED` on every run, and every one of those e2e
+suites still passes end-to-end, exactly as designed.
+
+### Notification types (`src/modules/notifications/enums/notification-type.enum.ts`)
+
+A plain TypeScript `const` object, not a Prisma enum - `Notification.type`
+is a `String` column, so adding a new type is a code change (plus a
+`TEMPLATES` entry) rather than a schema migration, the same reasoning
+`AuditLog.action` already established. The ~23 types in this phase:
+
+- **Residency**: `RESIDENCY_CHECKED_IN`, `RESIDENCY_CHECKED_OUT` (wired);
+  `RESIDENCY_NOTICE_PERIOD` (defined, **not wired** - see "Known
+  limitations" below)
+- **Rent**: `RENT_INVOICE_ISSUED`, `RENT_INVOICE_OVERDUE`,
+  `RENT_PAYMENT_SUCCESS`, `RENT_PAYMENT_FAILED`
+- **Food**: `FOOD_MENU_PUBLISHED`, `FOOD_MENU_UPDATED`,
+  `FOOD_SUBSCRIPTION_CREATED`, `FOOD_SUBSCRIPTION_PAUSED`,
+  `FOOD_SUBSCRIPTION_RESUMED`, `FOOD_SUBSCRIPTION_CANCELLED`,
+  `FOOD_SUBSCRIPTION_PAYMENT_DUE`, `FOOD_SUBSCRIPTION_PAYMENT_SUCCESS`
+- **Complaints**: `COMPLAINT_CREATED`, `COMPLAINT_ASSIGNED`,
+  `COMPLAINT_STATUS_CHANGED`, `COMPLAINT_RESOLVED`, `COMPLAINT_CLOSED`
+  (`CANCELLED` deliberately has no dedicated type/emit - see "Known
+  limitations")
+- **Owner SaaS subscription**: `SAAS_SUBSCRIPTION_RENEWAL_DUE`,
+  `SAAS_SUBSCRIPTION_PAYMENT_SUCCESS`, `SAAS_SUBSCRIPTION_PAYMENT_FAILED`,
+  `SAAS_SUBSCRIPTION_SUSPENDED`
+- **Platform**: `SYSTEM_ANNOUNCEMENT` (defined for future Super Admin
+  broadcast use; no emitter exists yet)
+
+### Channels & provider abstraction
+
+Five channels (`NotificationChannel`: `IN_APP | PUSH | EMAIL | WHATSAPP |
+SMS`), each behind the same `NotificationProvider` interface
+(`providerName`, `send(input) -> { status, providerMessageId?,
+failureReason? }`) so `NotificationDeliveryService` never depends on a
+concrete SDK. `IN_APP_PROVIDER` resolves to `InAppNotificationProvider` -
+"delivery" here just means the `Notification` row exists, so it always
+reports `SENT`. **`PUSH_PROVIDER`/`EMAIL_PROVIDER`/`WHATSAPP_PROVIDER`/
+`SMS_PROVIDER` all resolve to the same `NoopNotificationProvider` class
+today**, parametrized only by name, and always report `SKIPPED` with a
+`failureReason` - never a false `SENT`/`DELIVERED` for a channel this
+backend cannot actually reach (no FCM/APNs/SendGrid/Twilio/WhatsApp
+Business API credentials exist in this environment). Wiring a real
+provider for exactly one channel later is a one-line change to that
+channel's binding in `notifications.module.ts`, never a change to
+`NotificationDeliveryService` or any business module.
+
+### In-app implementation
+
+`IN_APP` is the only channel Phase 11 actually delivers - a `Notification`
+row scoped to `userId`, surfaced through `GET/POST /me/notifications*`.
+`MANDATORY_CHANNEL = 'IN_APP'` is enforced in two places (defense in
+depth): `NotificationPreferencesService.update` rejects any request that
+tries to disable it before writing anything, and
+`isChannelEnabled` reports it enabled unconditionally regardless of any
+stored preference row. `NotificationResponseDto` deliberately never
+exposes delivery internals (`providerMessageId`, retry counts, provider
+errors) - the client only ever needs notification content.
+
+### Preferences model
+
+`NotificationPreference` is a sparse, per-`(userId, notificationType,
+channel)` override table (`@@unique([userId, notificationType,
+channel])`) - a user with no rows at all still gets sensible behavior via
+`DEFAULT_ENABLED` (`IN_APP: true, PUSH: true, EMAIL: false, WHATSAPP:
+false, SMS: false`). `PUT /me/notifications/preferences` is a batch
+upsert inside one `$transaction` (never a single-field PATCH), so a
+mobile settings screen's multi-toggle save is atomic - if the batch
+contains an attempt to disable `IN_APP`, the whole request is rejected
+with `409 NOTIFICATION_MANDATORY_TYPE` before any row is written, not
+after a partial apply.
+
+### Push-device implementation
+
+`PushDevice` rows are keyed by `@@unique([provider, token])`, not by
+user - `PushDevicesService.register` looks up by that pair first and
+updates the existing row in place (including reassigning `userId`) rather
+than ever raising a unique-constraint conflict or accumulating duplicate
+rows for what is, at the OS/gateway level, the same physical destination
+re-registering (e.g. a device logged out and back in as a different
+user). The raw token is never returned by `PushDeviceResponseDto` - the
+client already has its own token. `NotificationDeliveryService` additionally
+requires an active `PushDevice` before ever invoking the `PUSH` provider,
+regardless of channel preference - `SKIPPED` with `"No active push device
+registered."`, never a wasted provider call.
+
+### Idempotency strategy
+
+`Notification.idempotencyKey` carries a real `@unique` database
+constraint - `NotificationsService.publish` always derives it from the
+actual business event (e.g. `RENT_PAYMENT_SUCCESS:<paymentId>`,
+`FOOD_MENU_PUBLISHED:<menuId>:<menu.updatedAt.getTime()>`), never a
+random value, so a retried/duplicated business event can only ever
+produce the same key. A `P2002` on `create` is caught, the existing row
+is re-read and returned, and - critically - delivery is **only** attempted
+for a notification this call actually created, never for one that already
+existed. Verified against real Postgres: emitting the same event twice in
+a row yields exactly one `Notification` row and exactly one delivery
+attempt per channel (see "Real PostgreSQL verification" below).
+
+### Event-driven integration (all wiring in already-existing business
+services, each emitting only after its own write/transaction commits)
+
+| Business service | Trigger | Notification type(s) |
+| --- | --- | --- |
+| `ResidenciesService` | `checkIn()` | `RESIDENCY_CHECKED_IN` |
+| `ResidenciesService` | `checkOut()` | `RESIDENCY_CHECKED_OUT` |
+| `InvoicesService` | `issue()` | `RENT_INVOICE_ISSUED` |
+| `InvoicesService` | `evaluateOverdue()` | `RENT_INVOICE_OVERDUE` |
+| `PaymentsService` | `finalizeCapturedPayment()` | `RENT_PAYMENT_SUCCESS` / `RENT_PAYMENT_FAILED` |
+| `PaymentsService` | `verifyPayment()` invalid signature | `RENT_PAYMENT_FAILED` |
+| `FoodMenusService` | `publish()` | `FOOD_MENU_PUBLISHED` |
+| `FoodMenusService` | `replaceItems`/`addItem`/`updateItem`/`removeItem` on a `PUBLISHED` menu | `FOOD_MENU_UPDATED` |
+| `FoodSubscriptionsService` | `subscribe()` | `FOOD_SUBSCRIPTION_CREATED` |
+| `FoodSubscriptionsService` | `cancel()` | `FOOD_SUBSCRIPTION_CANCELLED` |
+| `FoodSubscriptionsService` | `transition()` | `FOOD_SUBSCRIPTION_PAUSED` / `FOOD_SUBSCRIPTION_RESUMED` |
+| `FoodBillingService` | `evaluateRenewal()` renewal branch | `FOOD_SUBSCRIPTION_PAYMENT_DUE` |
+| `FoodBillingService` | `finalizeCapturedPayment()` | `FOOD_SUBSCRIPTION_PAYMENT_SUCCESS` |
+| `ComplaintsService` | `create()` | `COMPLAINT_CREATED` |
+| `ComplaintLifecycleService` | `assign()` | `COMPLAINT_ASSIGNED` |
+| `ComplaintLifecycleService` | `transition()` | `COMPLAINT_RESOLVED` / `COMPLAINT_CLOSED` / `COMPLAINT_STATUS_CHANGED` |
+| `SubscriptionsService` | `evaluateLifecycle()` (only on an actual transition, never a no-op re-evaluation) | `SAAS_SUBSCRIPTION_RENEWAL_DUE` / `SAAS_SUBSCRIPTION_SUSPENDED` |
+| `SubscriptionPaymentsService` | `verifyPayment()` invalid signature | `SAAS_SUBSCRIPTION_PAYMENT_FAILED` |
+| `SubscriptionPaymentsService` | `finalizeCapturedPayment()` | `SAAS_SUBSCRIPTION_PAYMENT_SUCCESS` / `SAAS_SUBSCRIPTION_PAYMENT_FAILED` |
+
+`NotificationEventService.onModuleInit()` is the **single** subscriber for
+all of the above - every handler re-reads its referenced entity fresh
+from Postgres via `PrismaService` before resolving a recipient or
+rendering a template (spec: never trust the event payload beyond "which
+row to look up"). Payloads are always just entity ids
+(`{ residencyId }`, `{ menuId }`, ...), never a recipient user id and
+never pre-rendered text - see `notification-event.types.ts`.
+
+### Recipient resolution (`NotificationRecipientsService`)
+
+Three reusable, purely server-side resolvers, all backed by real
+relationships rather than any client input:
+
+- `tenantUserIdForResidency(residencyId)` - `Residency -> Tenant ->
+  Tenant.userId`; returns `null` (never throws) if unresolvable.
+- `activeTenantUserIdsForProperty(propertyId)` - every tenant with an
+  `ACTIVE`/`NOTICE_PERIOD` residency at **that property only** - the
+  mandatory cross-property isolation case for `FOOD_MENU_PUBLISHED`/
+  `FOOD_MENU_UPDATED` (a Property B tenant must never be notified about
+  Property A's menu, even within the same organization). Verified both
+  by unit test and against real Postgres.
+- `activeOrgMembersByRole(organizationId, roles)` - `ACTIVE`
+  `OrganizationMembership` rows only, scoped to one organization, used for
+  `COMPLAINT_CREATED` (staff fan-out) and every SaaS-subscription
+  notification (`OWNER` only - a tenant is never notified about the
+  organization's own platform billing).
+
+### Super Admin visibility (deliberately minimal)
+
+`NotificationAdminController` (`GET /admin/notifications/overview`,
+`JwtAuthGuard` + `PlatformAdminGuard`) is the **only** platform-admin
+surface this phase adds, and it returns aggregate delivery-health counts
+only (`totalNotifications`, `unreadNotifications`,
+`deliveriesByStatus`/`deliveriesByChannel` via `groupBy`) - never a
+notification's own title/body/data, and there is **no**
+`GET /admin/notifications` listing endpoint at all. Notifications are
+user-private; Super Admin gets platform health visibility, never another
+user's inbox.
+
+### Testing strategy
+
+Unit tests (`src/modules/notifications/**/*.spec.ts`, one file per
+service, same plain-construction-with-mocked-dependencies style as every
+prior phase) cover idempotent `publish()`, template rendering, recipient
+resolution and property/organization isolation, preference
+defaults/mandatory-channel enforcement, per-channel delivery filtering
+(disabled preference, PUSH-with-no-device), provider-failure isolation,
+`markRead`/`markAllRead` atomicity and BOLA-safety, push-device
+registration/token-reassignment, and every `NotificationEventService`
+handler's "re-read fresh, never trust the payload" behavior.
+`test/phase11-notifications.e2e-spec.ts` follows the same
+per-suite `FakePrisma` pattern as every prior phase's e2e file and drives
+the full HTTP surface (list/unread-count/get-one/mark-read/mark-all-read,
+preferences, push devices, the admin overview endpoint) plus cross-user
+BOLA isolation.
+
+### Real PostgreSQL verification
+
+A one-off `scripts/verify-phase11-notifications.ts` (run via
+`NestFactory.createApplicationContext(AppModule)` for full DI fidelity,
+then deleted - the standing convention for this kind of check) confirmed
+against the real Postgres container:
+
+- Emitting the same business event twice in a row (simulating a retried
+  emit) produces **exactly one** `Notification` row.
+- Emitting for an entity id that was never actually committed produces
+  **zero** notifications - modeling "a failed business transaction never
+  triggers its success notification," since every real call site only
+  emits after its own write has already succeeded.
+- `FOOD_MENU_PUBLISHED` cross-property isolation: a Property A tenant
+  receives the notification, a Property B tenant in the same organization
+  does not.
+- Three concurrent `markRead` calls on the same notification all resolve
+  without error, and the row ends up `READ` exactly once.
+- Four repeated `NotificationDeliveryService.deliverAll` attempts against
+  the same notification still leave exactly 5 `NotificationDelivery` rows
+  (one per channel) - `attemptCount` increments in place on the same row,
+  never a new one, confirming the `@@unique([notificationId, channel])`
+  upsert behaves correctly under real Postgres.
+
+All seeded data (a dedicated organization/properties/tenants/menu, ids
+tagged with a per-run id) was deleted at the end of the run; a follow-up
+query confirmed zero leftover rows.
+
+### Bugs found and fixed during Phase 11 verification
+
+- **Route shadowing**: `NotificationsController` (`me/notifications`) was
+  registered before `NotificationPreferencesController`
+  (`me/notifications/preferences`) and `PushDevicesController`
+  (`me/notifications/devices`) in `NotificationsModule`. Because Nest
+  binds each controller's routes to the underlying Express router in
+  module-array order, and Express matches overlapping routes
+  first-registered-wins, `NotificationsController`'s `GET/POST
+  'me/notifications/:id...'` wildcard was silently shadowing both other
+  controllers' same-segment-count literal paths (`:id` greedily matched
+  `"preferences"`/`"devices"` as an id). Fixed by reordering the
+  `controllers` array so the literal-path controllers are registered
+  first - no route strings changed.
+- **Inconsistent HTTP status codes**: every other action-style `POST`
+  endpoint in this codebase (e.g. `complaints/:id/assign`) explicitly sets
+  `@HttpCode(HttpStatus.OK)`; `POST /me/notifications/:id/read` and
+  `POST /me/notifications/read-all` were missing it and so defaulted to
+  Nest's `201 Created`. Fixed by adding the same `@HttpCode(HttpStatus.OK)`
+  decorator, matching the established convention.
+
+### Known limitations
+
+- **`DomainEventBusService` is in-process only** - there is no outbox
+  table and no at-least-once redelivery guarantee across a process crash
+  between "business transaction committed" and "listener ran." If the
+  process dies in that narrow window, the notification for that one event
+  is permanently lost, the same way an uncaught exception before this
+  phase would have silently lost any other post-commit side effect. A
+  future migration to an outbox/queue-backed dispatcher only needs to
+  change this one class's internals - no business module's call sites, and
+  no notification-side consumer, would need to change.
+- **`RESIDENCY_NOTICE_PERIOD` has no wired trigger** - the type is defined
+  and templated, but no code path anywhere in this codebase currently
+  transitions a `Residency` to `NOTICE_PERIOD` (that status exists in the
+  `ResidencyStatus` enum but nothing in Phase 4-10 ever sets it), so there
+  is nothing to hang the emit off of yet. Wiring it is a one-line addition
+  to whatever future service introduces that transition.
+- **`COMPLAINT_CANCELLED` has no dedicated notification** -
+  `ComplaintLifecycleService.transition()`'s `CANCELLED` branch does not
+  emit, since no `NotificationType` exists for it (cancellation is
+  self-service by the reporting tenant, who already knows they just
+  cancelled their own complaint) - not an oversight, but worth revisiting
+  if staff ever need to be notified of a tenant-initiated cancellation.
+- **`SYSTEM_ANNOUNCEMENT` has no emitter** - the type and template exist
+  for a future Super Admin broadcast feature, but nothing in this phase
+  calls it; building that emitter (and its authorization) is out of
+  scope here.
+- **PUSH/EMAIL/WHATSAPP/SMS are all `NoopNotificationProvider` today** -
+  correct, honestly-reported `SKIPPED` behavior, but no notification on
+  those four channels is ever actually delivered to a real device/inbox
+  until real provider credentials (FCM/APNs, SendGrid, Twilio, WhatsApp
+  Business API) are integrated.
+
 ## Roadmap
 
 Phase 0 (done) → Phase 1 (done): platform identity, auth, sessions, KYC
@@ -3384,5 +3679,8 @@ assignment, PUBLIC/INTERNAL comments, activity trail, attachments,
 resolved subscription-access policy) → Phase 10 (this repository, done):
 food, meals & menu (included-in-rent + optional paid subscription models,
 daily/weekly menu management with a live-update publish lifecycle, tenant
-dashboard, isolated food billing, meal consumption) → Phase 11:
-notifications.
+dashboard, isolated food billing, meal consumption) → Phase 11 (this
+repository, done): notifications & communication infrastructure (an
+in-process domain event bus, ~20 business-event integrations, in-app +
+stubbed push/email/WhatsApp/SMS channels, per-user preferences, push-device
+registration, idempotent delivery, Super Admin aggregate-only visibility).

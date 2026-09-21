@@ -5,6 +5,7 @@ import { ErrorCode } from '../../common/constants/error-code.enum';
 import { MembershipsService } from '../memberships/memberships.service';
 import { SaasPlansService } from '../saas-plans/saas-plans.service';
 import { SubscriptionInvoicesService } from '../subscription-invoices/subscription-invoices.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
 import { SubscriptionsService } from './subscriptions.service';
 
 function buildUser(
@@ -75,6 +76,7 @@ describe('SubscriptionsService', () => {
   };
   let subscriptionInvoices: { generateForPeriod: jest.Mock };
   let configService: ConfigService;
+  let eventBus: { emit: jest.Mock };
 
   function mockTx(subscription: any) {
     const tx = {
@@ -121,11 +123,14 @@ describe('SubscriptionsService', () => {
       membership: { role: 'OWNER' },
     });
 
+    eventBus = { emit: jest.fn().mockResolvedValue(undefined) };
+
     service = new SubscriptionsService(
       prisma as any,
       memberships as unknown as MembershipsService,
       saasPlans as unknown as SaasPlansService,
       subscriptionInvoices as unknown as SubscriptionInvoicesService,
+      eventBus as unknown as DomainEventBusService,
       configService,
     );
   });

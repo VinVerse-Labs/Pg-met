@@ -6,6 +6,8 @@ import { ErrorCode } from '../../common/constants/error-code.enum';
 import { MembershipsService } from '../memberships/memberships.service';
 import { PropertiesService } from '../properties/properties.service';
 import { ResidenciesService } from '../residencies/residencies.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
+import { NotificationType } from '../notifications/enums/notification-type.enum';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { GenerateInvoiceDto } from './dto/generate-invoice.dto';
 import { UpdateInvoiceDto } from './dto/update-invoice.dto';
@@ -45,6 +47,7 @@ export class InvoicesService {
     private readonly memberships: MembershipsService,
     private readonly properties: PropertiesService,
     private readonly residencies: ResidenciesService,
+    private readonly eventBus: DomainEventBusService,
   ) {}
 
   // The one and only invoice creation path (spec section 28) - a
@@ -277,6 +280,9 @@ export class InvoicesService {
       include: { items: true },
     });
     this.logger.log(`INVOICE_ISSUED invoice=${invoiceId} by=${user.id}`);
+    await this.eventBus.emit(NotificationType.RENT_INVOICE_ISSUED, {
+      invoiceId,
+    });
     return InvoiceResponseDto.fromEntity(updated);
   }
 
@@ -380,11 +386,19 @@ export class InvoicesService {
     invoice: InvoiceWithItems,
   ): Promise<InvoiceWithItems> {
     if (invoice.status === 'ISSUED' && invoice.dueDate.getTime() < Date.now()) {
-      return this.prisma.invoice.update({
+      const updated = await this.prisma.invoice.update({
         where: { id: invoice.id },
         data: { status: 'OVERDUE' },
         include: { items: true },
       });
+      // This lazy ISSUED -> OVERDUE transition only ever happens once per
+      // invoice (subsequent reads see status already OVERDUE and skip
+      // this branch entirely), so the event fires exactly once - never on
+      // every incidental read.
+      await this.eventBus.emit(NotificationType.RENT_INVOICE_OVERDUE, {
+        invoiceId: invoice.id,
+      });
+      return updated;
     }
     return invoice;
   }

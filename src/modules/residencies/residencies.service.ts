@@ -7,6 +7,8 @@ import { MembershipsService } from '../memberships/memberships.service';
 import { PropertiesService } from '../properties/properties.service';
 import { TenantsService } from '../tenants/tenants.service';
 import { FoodSubscriptionsService } from '../food/services/food-subscriptions.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
+import { NotificationType } from '../notifications/enums/notification-type.enum';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { CreateResidencyDto } from './dto/create-residency.dto';
 import { UpdateResidencyDto } from './dto/update-residency.dto';
@@ -40,6 +42,7 @@ export class ResidenciesService {
     private readonly properties: PropertiesService,
     private readonly tenants: TenantsService,
     private readonly foodSubscriptions: FoodSubscriptionsService,
+    private readonly eventBus: DomainEventBusService,
   ) {}
 
   // Creates a residency in PENDING - no bed is allocated here (see spec
@@ -248,6 +251,12 @@ export class ResidenciesService {
       this.logger.log(
         `RESIDENCY_CHECKED_IN residency=${residencyId} bed=${dto.bedId} by=${user.id}`,
       );
+      // Fired after the transaction has already committed (spec section
+      // 46) - a notification failure can never roll back or fail the
+      // check-in itself (DomainEventBusService.emit never throws).
+      await this.eventBus.emit(NotificationType.RESIDENCY_CHECKED_IN, {
+        residencyId,
+      });
       return {
         residency: ResidencyResponseDto.fromEntity(result.residency),
         allocation: BedAllocationResponseDto.fromEntity(result.allocation),
@@ -332,6 +341,9 @@ export class ResidenciesService {
     this.logger.log(
       `RESIDENCY_CHECKED_OUT residency=${residencyId} by=${user.id}`,
     );
+    await this.eventBus.emit(NotificationType.RESIDENCY_CHECKED_OUT, {
+      residencyId,
+    });
     return {
       residency: ResidencyResponseDto.fromEntity(result.residency),
       allocation: BedAllocationResponseDto.fromEntity(result.allocation),

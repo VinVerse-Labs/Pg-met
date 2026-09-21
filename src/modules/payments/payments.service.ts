@@ -19,6 +19,8 @@ import {
   PaymentGateway,
 } from './gateway/payment-gateway.interface';
 import { PlatformFeeService } from './platform-fee.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
+import { NotificationType } from '../notifications/enums/notification-type.enum';
 import { decimalToSmallestUnit } from './money.util';
 import { CreatePaymentOrderDto } from './dto/create-payment-order.dto';
 import { VerifyPaymentDto } from './dto/verify-payment.dto';
@@ -45,6 +47,7 @@ export class PaymentsService {
     private readonly prisma: PrismaService,
     private readonly memberships: MembershipsService,
     private readonly platformFee: PlatformFeeService,
+    private readonly eventBus: DomainEventBusService,
     configService: ConfigService,
     @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
   ) {
@@ -191,6 +194,9 @@ export class PaymentsService {
           failureMessage: 'Payment signature verification failed.',
         },
       });
+      await this.eventBus.emit(NotificationType.RENT_PAYMENT_FAILED, {
+        paymentId: payment.id,
+      });
       throw new AppException(
         ErrorCode.PAYMENT_GATEWAY_ERROR,
         'Payment signature verification failed.',
@@ -241,7 +247,7 @@ export class PaymentsService {
     providerPaymentId: string,
     method?: string,
   ): Promise<Payment> {
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const payment = await tx.payment.findUnique({ where: { id: paymentId } });
       if (!payment) {
         throw new AppException(
@@ -334,6 +340,25 @@ export class PaymentsService {
       );
       return captured;
     });
+
+    // Fired after the transaction has already committed (spec section
+    // 46) - never inside it. Idempotency (spec section 32/76): both a
+    // client-verify call and a webhook retry converge on this same
+    // method, and both a genuinely-first finalize and a subsequent
+    // already-CAPTURED early-return end up here - the event's own
+    // `type:paymentId` idempotency key (see NotificationEventService)
+    // is what collapses any resulting duplicate emission into exactly
+    // one notification, not this call site.
+    if (result.status === 'CAPTURED') {
+      await this.eventBus.emit(NotificationType.RENT_PAYMENT_SUCCESS, {
+        paymentId,
+      });
+    } else if (result.status === 'FAILED') {
+      await this.eventBus.emit(NotificationType.RENT_PAYMENT_FAILED, {
+        paymentId,
+      });
+    }
+    return result;
   }
 
   async findForInvoice(

@@ -3,6 +3,7 @@ import { AuthenticatedUser } from '../../auth/strategies/jwt.strategy';
 import { ErrorCode } from '../../../common/constants/error-code.enum';
 import { MembershipsService } from '../../memberships/memberships.service';
 import { PaymentGateway } from '../../payments/gateway/payment-gateway.interface';
+import { DomainEventBusService } from '../../../common/events/domain-event-bus.service';
 import { FoodBillingService } from './food-billing.service';
 
 function buildUser(
@@ -38,6 +39,7 @@ describe('FoodBillingService', () => {
   let memberships: { getActiveMembership: jest.Mock };
   let gateway: jest.Mocked<PaymentGateway>;
   let configService: { get: jest.Mock };
+  let eventBus: { emit: jest.Mock };
 
   beforeEach(() => {
     prisma = {
@@ -67,10 +69,12 @@ describe('FoodBillingService', () => {
     configService = {
       get: jest.fn().mockReturnValue({ keyId: 'rzp_test_key' }),
     };
+    eventBus = { emit: jest.fn().mockResolvedValue(undefined) };
 
     service = new FoodBillingService(
       prisma,
       memberships as unknown as MembershipsService,
+      eventBus as unknown as DomainEventBusService,
       configService as any,
       gateway,
     );

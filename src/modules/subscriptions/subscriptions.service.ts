@@ -9,6 +9,8 @@ import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { SubscriptionConfig } from '../../config/configuration';
 import { SaasPlansService } from '../saas-plans/saas-plans.service';
 import { SubscriptionInvoicesService } from '../subscription-invoices/subscription-invoices.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
+import { NotificationType } from '../notifications/enums/notification-type.enum';
 import {
   addDaysUtc,
   computeNextSubscriptionPeriod,
@@ -41,6 +43,7 @@ export class SubscriptionsService {
     private readonly memberships: MembershipsService,
     private readonly saasPlans: SaasPlansService,
     private readonly subscriptionInvoices: SubscriptionInvoicesService,
+    private readonly eventBus: DomainEventBusService,
     configService: ConfigService,
   ) {
     const config = configService.get<SubscriptionConfig>('subscription')!;
@@ -190,7 +193,8 @@ export class SubscriptionsService {
   async evaluateLifecycle(
     subscriptionId: string,
   ): Promise<SubscriptionWithPlan> {
-    return this.prisma.$transaction(async (tx) => {
+    let transitionedTo: 'RENEWAL_DUE' | 'SUSPENDED' | null = null;
+    const result = await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM organization_subscriptions WHERE id = ${subscriptionId} FOR UPDATE`;
       let subscription = await tx.organizationSubscription.findUniqueOrThrow({
         where: { id: subscriptionId },
@@ -239,6 +243,7 @@ export class SubscriptionsService {
         this.logger.log(
           `SUBSCRIPTION_RENEWAL_DUE subscription=${subscription.id} period=${periodStart.toISOString()}..${periodEnd.toISOString()}`,
         );
+        transitionedTo = 'RENEWAL_DUE';
         return subscription;
       }
 
@@ -270,11 +275,31 @@ export class SubscriptionsService {
         this.logger.log(
           `SUBSCRIPTION_SUSPENDED subscription=${subscription.id}`,
         );
+        transitionedTo = 'SUSPENDED';
         return subscription;
       }
 
       return subscription;
     });
+
+    // Fired after the transaction has already committed (spec section
+    // 46). `transitionedTo` is only ever set on the exact call that
+    // caused the transition - every subsequent read that finds the
+    // subscription already in that state takes the final `return
+    // subscription` branch and never re-emits (the same "the state
+    // machine's own one-way transition is the idempotency guarantee"
+    // pattern Phase 5's evaluateOverdue/this phase's own menu-publish
+    // notification both already rely on).
+    if (transitionedTo === 'RENEWAL_DUE') {
+      await this.eventBus.emit(NotificationType.SAAS_SUBSCRIPTION_RENEWAL_DUE, {
+        organizationId: result.organizationId,
+      });
+    } else if (transitionedTo === 'SUSPENDED') {
+      await this.eventBus.emit(NotificationType.SAAS_SUBSCRIPTION_SUSPENDED, {
+        organizationId: result.organizationId,
+      });
+    }
+    return result;
   }
 
   // The read-only half of the access policy (see SubscriptionAccessGuard's

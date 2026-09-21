@@ -5,6 +5,7 @@ import { MembershipsService } from '../memberships/memberships.service';
 import { SubscriptionInvoicesService } from '../subscription-invoices/subscription-invoices.service';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import { PaymentGateway } from '../payments/gateway/payment-gateway.interface';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
 import { SubscriptionPaymentsService } from './subscription-payments.service';
 
 function buildUser(
@@ -65,6 +66,7 @@ describe('SubscriptionPaymentsService', () => {
   let subscriptionsService: { activateFromPayment: jest.Mock };
   let gateway: jest.Mocked<PaymentGateway>;
   let configService: any;
+  let eventBus: { emit: jest.Mock };
 
   beforeEach(() => {
     prisma = {
@@ -101,11 +103,14 @@ describe('SubscriptionPaymentsService', () => {
       }),
     };
 
+    eventBus = { emit: jest.fn().mockResolvedValue(undefined) };
+
     service = new SubscriptionPaymentsService(
       prisma,
       memberships as unknown as MembershipsService,
       subscriptionInvoices as unknown as SubscriptionInvoicesService,
       subscriptionsService as unknown as SubscriptionsService,
+      eventBus as unknown as DomainEventBusService,
       configService,
       gateway,
     );

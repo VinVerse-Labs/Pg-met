@@ -11,6 +11,8 @@ import {
   paginationSkipTake,
 } from '../../common/dto/pagination-query.dto';
 import { ComplaintActivityService } from './complaint-activity.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
+import { NotificationType } from '../notifications/enums/notification-type.enum';
 import { CreateComplaintDto } from './dto/create-complaint.dto';
 import { ListComplaintsQueryDto } from './dto/list-complaints.query.dto';
 import { ComplaintResponseDto } from './dto/complaint-response.dto';
@@ -34,6 +36,7 @@ export class ComplaintsService {
     private readonly memberships: MembershipsService,
     private readonly subscriptions: SubscriptionsService,
     private readonly activity: ComplaintActivityService,
+    private readonly eventBus: DomainEventBusService,
   ) {}
 
   // The one and only complaint-creation path. Every identity field
@@ -116,6 +119,9 @@ export class ComplaintsService {
     this.logger.log(
       `COMPLAINT_CREATED complaint=${complaint.id} organization=${organizationId} tenant=${tenant.id} by=${user.id}`,
     );
+    await this.eventBus.emit(NotificationType.COMPLAINT_CREATED, {
+      complaintId: complaint.id,
+    });
     return ComplaintResponseDto.fromEntity(complaint);
   }
 

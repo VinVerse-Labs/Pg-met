@@ -17,6 +17,8 @@ import {
   PaymentGateway,
 } from '../../payments/gateway/payment-gateway.interface';
 import { decimalToSmallestUnit } from '../../payments/money.util';
+import { DomainEventBusService } from '../../../common/events/domain-event-bus.service';
+import { NotificationType } from '../../notifications/enums/notification-type.enum';
 import {
   addOneCalendarMonthUtc,
   addDaysUtc,
@@ -44,6 +46,7 @@ export class FoodBillingService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly memberships: MembershipsService,
+    private readonly eventBus: DomainEventBusService,
     configService: ConfigService,
     @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
   ) {
@@ -127,6 +130,14 @@ export class FoodBillingService {
     const periodEnd = addDaysUtc(addOneCalendarMonthUtc(periodStart), -1);
     try {
       await this.generateInvoiceForPeriod(subscription, periodStart, periodEnd);
+      // Only the renewal branch notifies "payment due" (spec section
+      // 70) - the very first invoice at subscribe time is covered by its
+      // own FOOD_SUBSCRIPTION_CREATED notification instead, so a brand
+      // new subscriber never gets two notifications for the same first
+      // bill.
+      await this.eventBus.emit(NotificationType.FOOD_SUBSCRIPTION_PAYMENT_DUE, {
+        subscriptionId: subscription.id,
+      });
     } catch (error) {
       // Two concurrent evaluations racing to generate the same period -
       // the unique constraint (foodSubscriptionId, billingPeriodStart,
@@ -342,7 +353,7 @@ export class FoodBillingService {
     paymentId: string,
     providerPaymentId: string,
   ): Promise<FoodSubscriptionPayment> {
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const payment = await tx.foodSubscriptionPayment.findUnique({
         where: { id: paymentId },
       });
@@ -385,6 +396,14 @@ export class FoodBillingService {
       );
       return captured;
     });
+
+    if (result.status === 'CAPTURED') {
+      await this.eventBus.emit(
+        NotificationType.FOOD_SUBSCRIPTION_PAYMENT_SUCCESS,
+        { foodSubscriptionPaymentId: paymentId },
+      );
+    }
+    return result;
   }
 
   async findByProviderOrderId(

@@ -14,6 +14,8 @@ import {
 import { decimalToSmallestUnit } from '../payments/money.util';
 import { SubscriptionInvoicesService } from '../subscription-invoices/subscription-invoices.service';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
+import { NotificationType } from '../notifications/enums/notification-type.enum';
 import { CreateSubscriptionPaymentOrderDto } from './dto/create-subscription-payment-order.dto';
 import { VerifySubscriptionPaymentDto } from './dto/verify-subscription-payment.dto';
 import { SubscriptionPaymentOrderResponseDto } from './dto/subscription-payment-order-response.dto';
@@ -38,6 +40,7 @@ export class SubscriptionPaymentsService {
     private readonly memberships: MembershipsService,
     private readonly subscriptionInvoices: SubscriptionInvoicesService,
     private readonly subscriptionsService: SubscriptionsService,
+    private readonly eventBus: DomainEventBusService,
     configService: ConfigService,
     @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
   ) {
@@ -160,6 +163,10 @@ export class SubscriptionPaymentsService {
           failureMessage: 'Payment signature verification failed.',
         },
       });
+      await this.eventBus.emit(
+        NotificationType.SAAS_SUBSCRIPTION_PAYMENT_FAILED,
+        { subscriptionPaymentId: payment.id },
+      );
       throw new AppException(
         ErrorCode.SUBSCRIPTION_PAYMENT_VERIFICATION_FAILED,
         'Payment signature verification failed.',
@@ -204,7 +211,7 @@ export class SubscriptionPaymentsService {
     paymentId: string,
     providerPaymentId: string,
   ): Promise<SubscriptionPayment> {
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const payment = await tx.subscriptionPayment.findUnique({
         where: { id: paymentId },
       });
@@ -259,6 +266,19 @@ export class SubscriptionPaymentsService {
       );
       return captured;
     });
+
+    if (result.status === 'CAPTURED') {
+      await this.eventBus.emit(
+        NotificationType.SAAS_SUBSCRIPTION_PAYMENT_SUCCESS,
+        { subscriptionPaymentId: paymentId },
+      );
+    } else if (result.status === 'FAILED') {
+      await this.eventBus.emit(
+        NotificationType.SAAS_SUBSCRIPTION_PAYMENT_FAILED,
+        { subscriptionPaymentId: paymentId },
+      );
+    }
+    return result;
   }
 
   async findForOrganization(

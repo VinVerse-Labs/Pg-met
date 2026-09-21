@@ -6,6 +6,8 @@ import { ErrorCode } from '../../../common/constants/error-code.enum';
 import { MembershipsService } from '../../memberships/memberships.service';
 import { PropertiesService } from '../../properties/properties.service';
 import { AuditLogService } from '../../audit-log/audit-log.service';
+import { DomainEventBusService } from '../../../common/events/domain-event-bus.service';
+import { NotificationType } from '../../notifications/enums/notification-type.enum';
 import { AuthenticatedUser } from '../../auth/strategies/jwt.strategy';
 import { CreateMenuDto } from '../dto/create-menu.dto';
 import { MenuItemInputDto } from '../dto/menu-item-input.dto';
@@ -32,6 +34,7 @@ export class FoodMenusService {
     private readonly memberships: MembershipsService,
     private readonly properties: PropertiesService,
     private readonly auditLog: AuditLogService,
+    private readonly eventBus: DomainEventBusService,
   ) {}
 
   async createDaily(
@@ -137,6 +140,7 @@ export class FoodMenusService {
     });
     this.logger.log(`FOOD_MENU_UPDATED menu=${menuId} by=${user.id}`);
     await this.auditMenu(user, updated, 'FOOD_MENU_UPDATED');
+    await this.notifyMenuUpdated(updated);
     return MenuResponseDto.fromEntity(updated);
   }
 
@@ -158,6 +162,7 @@ export class FoodMenusService {
     });
     this.logger.log(`FOOD_MENU_UPDATED menu=${menuId} by=${user.id}`);
     await this.auditMenu(user, updated, 'FOOD_MENU_UPDATED');
+    await this.notifyMenuUpdated(updated);
     return MenuResponseDto.fromEntity(updated);
   }
 
@@ -193,6 +198,7 @@ export class FoodMenusService {
     });
     this.logger.log(`FOOD_MENU_UPDATED menu=${menu.id} by=${user.id}`);
     await this.auditMenu(user, updated, 'FOOD_MENU_UPDATED');
+    await this.notifyMenuUpdated(updated);
     return MenuResponseDto.fromEntity(updated);
   }
 
@@ -211,6 +217,7 @@ export class FoodMenusService {
     await this.prisma.menuItem.delete({ where: { id: itemId } });
     this.logger.log(`FOOD_MENU_UPDATED menu=${menu.id} by=${user.id}`);
     await this.auditMenu(user, menu, 'FOOD_MENU_UPDATED');
+    await this.notifyMenuUpdated(menu);
   }
 
   // Atomic (spec section 29): the status flip is the one write, guarded by
@@ -242,6 +249,9 @@ export class FoodMenusService {
       include: { items: true },
     });
     await this.auditMenu(user, updated, 'FOOD_MENU_PUBLISHED');
+    await this.eventBus.emit(NotificationType.FOOD_MENU_PUBLISHED, {
+      menuId: updated.id,
+    });
     return MenuResponseDto.fromEntity(updated);
   }
 
@@ -512,6 +522,21 @@ export class FoodMenusService {
         propertyId: menu.propertyId,
         date: menu.date.toISOString().slice(0, 10),
       },
+    });
+  }
+
+  // Fired for a live edit to an already-PUBLISHED menu only (spec section
+  // 37-38) - a DRAFT edit is invisible to tenants anyway (see
+  // assertEditable's own doc comment), so notifying about it would be
+  // both pointless and a minor information leak of unpublished content.
+  // Never called from inside the same transaction as the mutation - see
+  // each call site, all of which are already past their own commit.
+  private async notifyMenuUpdated(menu: Menu): Promise<void> {
+    if (menu.status !== 'PUBLISHED') {
+      return;
+    }
+    await this.eventBus.emit(NotificationType.FOOD_MENU_UPDATED, {
+      menuId: menu.id,
     });
   }
 

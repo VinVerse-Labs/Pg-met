@@ -514,18 +514,21 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  memberships            OrganizationMembership[]
-  refreshTokens          RefreshToken[]
-  tenant                 Tenant?
-  identityVerifications  IdentityVerification[]
-  payments               Payment[]
-  auditLogs              AuditLog[]
-  reportedComplaints     Complaint[]              @relation("ComplaintReporter")
-  assignedComplaints     Complaint[]              @relation("ComplaintAssignee")
-  complaintActivities    ComplaintActivity[]
-  complaintComments      ComplaintComment[]
-  complaintAttachments   ComplaintAttachment[]
-  mealConsumptionsMarked MealConsumption[]        @relation("MealConsumptionMarkedBy")
+  memberships             OrganizationMembership[]
+  refreshTokens           RefreshToken[]
+  tenant                  Tenant?
+  identityVerifications   IdentityVerification[]
+  payments                Payment[]
+  auditLogs               AuditLog[]
+  reportedComplaints      Complaint[]              @relation("ComplaintReporter")
+  assignedComplaints      Complaint[]              @relation("ComplaintAssignee")
+  complaintActivities     ComplaintActivity[]
+  complaintComments       ComplaintComment[]
+  complaintAttachments    ComplaintAttachment[]
+  mealConsumptionsMarked  MealConsumption[]        @relation("MealConsumptionMarkedBy")
+  notifications           Notification[]
+  notificationPreferences NotificationPreference[]
+  pushDevices             PushDevice[]
 
   @@map("users")
 }
@@ -630,6 +633,7 @@ model Organization {
   foodSubscriptionPayments FoodSubscriptionPayment[]
   menus                    Menu[]
   mealConsumptions         MealConsumption[]
+  notifications            Notification[]
 
   @@map("organizations")
 }
@@ -695,6 +699,7 @@ model Property {
   foodSubscriptionPayments FoodSubscriptionPayment[]
   menus                    Menu[]
   mealConsumptions         MealConsumption[]
+  notifications            Notification[]
 
   @@index([organizationId])
   // Every tenant-scoped "list my properties" / "is this property archived"
@@ -2010,4 +2015,201 @@ model MealConsumption {
   @@index([tenantId, mealDate])
   @@index([menuId])
   @@map("meal_consumptions")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications & communication infrastructure (Phase 11)
+//
+// Notification (the logical message) and NotificationDelivery (one attempt
+// per channel) are deliberately separate - the same "one notification, many
+// delivery attempts" shape spec section 6 asks for. `Notification.type` is
+// a plain string, not a Prisma enum, the same "grows independently, never
+// needs a migration" reasoning already used for `AuditLog.action`/
+// `entityType` (Phase 8) - see `src/modules/notifications/enums/
+// notification-type.enum.ts` for the closed, documented set of values this
+// project actually emits today.
+// ---------------------------------------------------------------------------
+
+enum NotificationStatus {
+  UNREAD
+  READ
+}
+
+enum NotificationPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+// Only the channel identity itself is a fixed, small enum (used for
+// filtering/preference uniqueness) - unlike `type`, a new delivery channel
+// is a genuinely rare, deliberate architectural addition, not something
+// that should be addable by inserting a string.
+enum NotificationChannel {
+  IN_APP
+  PUSH
+  EMAIL
+  WHATSAPP
+  SMS
+}
+
+// IN_APP's own delivery is considered SENT the moment the Notification row
+// exists (spec section 16 - "delivery means the notification exists for
+// the user") - it never claims DELIVERED/FAILED for a channel this backend
+// cannot actually confirm receipt for. PENDING exists for a channel whose
+// provider call is still in flight; SKIPPED is the correct terminal state
+// for a channel the user has disabled or that has no configured provider -
+// never silently reported as DELIVERED.
+enum NotificationDeliveryStatus {
+  PENDING
+  SENT
+  DELIVERED
+  FAILED
+  SKIPPED
+}
+
+enum PushPlatform {
+  IOS
+  ANDROID
+  WEB
+}
+
+// Kept as an enum (not a bare string) for the same reason
+// `PaymentProvider`/`WebhookProvider` are - a second push provider later is
+// a new value, never a schema change to a free-form column whose values
+// this backend also has to validate. EXPO is the only value the React
+// Native/Expo mobile app actually needs; FCM/APNS are reserved for a
+// future direct-provider integration.
+enum PushTokenProvider {
+  EXPO
+  FCM
+  APNS
+}
+
+// The logical message intended for one user (spec section 6-7) - never
+// duplicated per channel. `organizationId`/`propertyId` are denormalized
+// onto the row (the same pattern Phase 6's `Payment` and Phase 9's
+// `Complaint` already use) purely for admin-facing aggregate queries -
+// they are never re-derived from `data` and never trusted from a caller,
+// always resolved server-side by whichever recipient resolver created the
+// row. `idempotencyKey` is what actually prevents a retried business event
+// from generating a duplicate notification (spec section 31/76) - always
+// derived from the real business event (e.g.
+// `RENT_PAYMENT_SUCCESS:<paymentId>`), never a random value, and enforced
+// by a database-level `@unique`, not just an application pre-check.
+model Notification {
+  id             String        @id @default(uuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  propertyId     String?
+  property       Property?     @relation(fields: [propertyId], references: [id], onDelete: SetNull)
+
+  type           String
+  title          String
+  body           String
+  data           Json?
+  priority       NotificationPriority @default(NORMAL)
+  status         NotificationStatus   @default(UNREAD)
+  idempotencyKey String?              @unique
+  readAt         DateTime?
+  expiresAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  deliveries NotificationDelivery[]
+
+  @@index([userId, createdAt])
+  @@index([userId, status])
+  @@index([userId, readAt])
+  @@index([type])
+  @@index([organizationId])
+  @@map("notifications")
+}
+
+// One delivery attempt record per (notification, channel) - never a new
+// row per retry (spec section 14/60: retries update `attemptCount`/
+// `lastAttemptAt` on the same row in place). `provider` is a free string
+// (`"IN_APP"`, `"NOOP"`, `"EXPO"`, ...) rather than an enum, deliberately -
+// see `Notification.type`'s own doc comment for the same reasoning; unlike
+// `channel` (a small, architecturally fixed set), which specific provider
+// backs a channel is exactly the kind of thing this phase's own spec asks
+// to keep pluggable without a migration.
+model NotificationDelivery {
+  id             String       @id @default(uuid())
+  notificationId String
+  notification   Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+
+  channel           NotificationChannel
+  provider          String
+  status            NotificationDeliveryStatus @default(PENDING)
+  providerMessageId String?
+  attemptCount      Int                        @default(0)
+  lastAttemptAt     DateTime?
+  deliveredAt       DateTime?
+  failedAt          DateTime?
+  failureReason     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([notificationId, channel], name: "notification_deliveries_notification_channel_unique")
+  @@index([notificationId])
+  @@index([status])
+  @@index([channel])
+  @@map("notification_deliveries")
+}
+
+// A user's own per-(notificationType, channel) opt-in/opt-out (spec
+// section 20-21) - never a separate table per role (spec section 91: "do
+// not create separate preference tables for OWNER/MANAGER/STAFF/TENANT" -
+// role-based defaults are a code-level policy, computed at read/write
+// time by `NotificationPreferencesService`, never stored per role here).
+model NotificationPreference {
+  id               String              @id @default(uuid())
+  userId           String
+  user             User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  notificationType String
+  channel          NotificationChannel
+  enabled          Boolean             @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, notificationType, channel], name: "notification_preferences_user_type_channel_unique")
+  @@index([userId])
+  @@map("notification_preferences")
+}
+
+// A registered mobile/web push endpoint for one user (spec section 52-57).
+// Generic by design - `provider`/`platform` are separate fields so this
+// project is never hardcoded to Expo specifically, even though Expo is the
+// only provider the React Native app needs today. `@@unique([provider,
+// token])` (not a bare unique on `token`) is deliberate: two different
+// providers could theoretically hand out overlapping opaque token strings,
+// and scoping the constraint to the provider is what makes "re-register
+// the same token" (spec section 55 - update in place, never duplicate)
+// correctly idempotent per provider.
+model PushDevice {
+  id         String            @id @default(uuid())
+  userId     String
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  platform   PushPlatform
+  provider   PushTokenProvider @default(EXPO)
+  token      String
+  deviceId   String?
+  appVersion String?
+  isActive   Boolean           @default(true)
+  lastSeenAt DateTime          @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([provider, token], name: "push_devices_provider_token_unique")
+  @@index([userId])
+  @@index([userId, isActive])
+  @@map("push_devices")
 }

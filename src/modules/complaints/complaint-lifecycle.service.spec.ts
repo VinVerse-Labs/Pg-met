@@ -3,6 +3,7 @@ import { ErrorCode } from '../../common/constants/error-code.enum';
 import { MembershipsService } from '../memberships/memberships.service';
 import { ComplaintsService } from './complaints.service';
 import { ComplaintActivityService } from './complaint-activity.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
 import { ComplaintLifecycleService } from './complaint-lifecycle.service';
 
 function buildUser(
@@ -40,6 +41,7 @@ describe('ComplaintLifecycleService', () => {
     assertOrganizationWritableOrThrow: jest.Mock;
   };
   let activity: { record: jest.Mock };
+  let eventBus: { emit: jest.Mock };
 
   function mockTx(updateManyCount = 1) {
     const tx = {
@@ -66,12 +68,14 @@ describe('ComplaintLifecycleService', () => {
       assertOrganizationWritableOrThrow: jest.fn().mockResolvedValue(undefined),
     };
     activity = { record: jest.fn() };
+    eventBus = { emit: jest.fn().mockResolvedValue(undefined) };
 
     service = new ComplaintLifecycleService(
       prisma,
       memberships as unknown as MembershipsService,
       complaints as unknown as ComplaintsService,
       activity as unknown as ComplaintActivityService,
+      eventBus as unknown as DomainEventBusService,
     );
   });
 

@@ -7,6 +7,7 @@ import { FoodConfigurationService } from './food-configuration.service';
 import { FoodEntitlementService } from './food-entitlement.service';
 import { FoodBillingService } from './food-billing.service';
 import { AuditLogService } from '../../audit-log/audit-log.service';
+import { DomainEventBusService } from '../../../common/events/domain-event-bus.service';
 import { FoodSubscriptionsService } from './food-subscriptions.service';
 
 function buildUser(
@@ -60,6 +61,7 @@ describe('FoodSubscriptionsService', () => {
   let saasSubscriptions: { isOrganizationWriteBlocked: jest.Mock };
   let billing: { generateInvoiceForPeriod: jest.Mock };
   let auditLog: { record: jest.Mock };
+  let eventBus: { emit: jest.Mock };
 
   beforeEach(() => {
     prisma = {
@@ -83,6 +85,7 @@ describe('FoodSubscriptionsService', () => {
     };
     billing = { generateInvoiceForPeriod: jest.fn().mockResolvedValue({}) };
     auditLog = { record: jest.fn().mockResolvedValue(undefined) };
+    eventBus = { emit: jest.fn().mockResolvedValue(undefined) };
 
     service = new FoodSubscriptionsService(
       prisma as any,
@@ -92,6 +95,7 @@ describe('FoodSubscriptionsService', () => {
       saasSubscriptions as unknown as SaasSubscriptionsService,
       billing as unknown as FoodBillingService,
       auditLog as unknown as AuditLogService,
+      eventBus as unknown as DomainEventBusService,
     );
   });
 

@@ -14,6 +14,8 @@ import { FoodConfigurationService } from './food-configuration.service';
 import { FoodEntitlementService } from './food-entitlement.service';
 import { FoodBillingService } from './food-billing.service';
 import { AuditLogService } from '../../audit-log/audit-log.service';
+import { DomainEventBusService } from '../../../common/events/domain-event-bus.service';
+import { NotificationType } from '../../notifications/enums/notification-type.enum';
 import { CreateFoodSubscriptionDto } from '../dto/create-food-subscription.dto';
 import { FoodSubscriptionResponseDto } from '../dto/food-subscription-response.dto';
 
@@ -35,6 +37,7 @@ export class FoodSubscriptionsService {
     private readonly saasSubscriptions: SaasSubscriptionsService,
     private readonly billing: FoodBillingService,
     private readonly auditLog: AuditLogService,
+    private readonly eventBus: DomainEventBusService,
   ) {}
 
   // Subscribing is the one action a tenant performs for themselves - the
@@ -157,6 +160,9 @@ export class FoodSubscriptionsService {
         foodPlanId: plan.id,
       },
     });
+    await this.eventBus.emit(NotificationType.FOOD_SUBSCRIPTION_CREATED, {
+      subscriptionId: subscription.id,
+    });
     return FoodSubscriptionResponseDto.fromEntity(subscription);
   }
 
@@ -272,6 +278,9 @@ export class FoodSubscriptionsService {
         residencyId: subscription.residencyId,
       },
     });
+    await this.eventBus.emit(NotificationType.FOOD_SUBSCRIPTION_CANCELLED, {
+      subscriptionId: subscription.id,
+    });
     const updated = await this.prisma.tenantFoodSubscription.findUniqueOrThrow({
       where: { id: subscription.id },
     });
@@ -320,6 +329,12 @@ export class FoodSubscriptionsService {
         residencyId: subscription.residencyId,
       },
     });
+    await this.eventBus.emit(
+      toStatus === 'PAUSED'
+        ? NotificationType.FOOD_SUBSCRIPTION_PAUSED
+        : NotificationType.FOOD_SUBSCRIPTION_RESUMED,
+      { subscriptionId: subscription.id },
+    );
     const updated = await this.prisma.tenantFoodSubscription.findUniqueOrThrow({
       where: { id: subscription.id },
     });

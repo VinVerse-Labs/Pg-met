@@ -7,6 +7,8 @@ import { MembershipsService } from '../memberships/memberships.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { ComplaintsService, ORG_COMPLAINT_ROLES } from './complaints.service';
 import { ComplaintActivityService } from './complaint-activity.service';
+import { DomainEventBusService } from '../../common/events/domain-event-bus.service';
+import { NotificationType } from '../notifications/enums/notification-type.enum';
 import { AssignComplaintDto } from './dto/assign-complaint.dto';
 import { ResolveComplaintDto } from './dto/resolve-complaint.dto';
 import { ChangePriorityDto } from './dto/change-priority.dto';
@@ -33,6 +35,7 @@ export class ComplaintLifecycleService {
     private readonly memberships: MembershipsService,
     private readonly complaints: ComplaintsService,
     private readonly activity: ComplaintActivityService,
+    private readonly eventBus: DomainEventBusService,
   ) {}
 
   // Assigning also transitions OPEN -> ASSIGNED (spec's lifecycle
@@ -102,6 +105,9 @@ export class ComplaintLifecycleService {
     this.logger.log(
       `COMPLAINT_ASSIGNED complaint=${complaintId} assignee=${dto.assignedToUserId} by=${user.id}`,
     );
+    await this.eventBus.emit(NotificationType.COMPLAINT_ASSIGNED, {
+      complaintId,
+    });
     return ComplaintResponseDto.fromEntity(updated);
   }
 
@@ -316,6 +322,24 @@ export class ComplaintLifecycleService {
     this.logger.log(
       `COMPLAINT_STATUS_CHANGED complaint=${complaint.id} ${fromStatus}->${toStatus} by=${user.id}`,
     );
+    // Only the tenant-facing terminal/status transitions notify (spec
+    // section 39/68) - CANCELLED has no dedicated notification type in
+    // this phase's spec (the cancelling actor, tenant or OWNER/MANAGER,
+    // already knows), so it is deliberately the one transition this
+    // switch does not emit for.
+    if (toStatus === 'RESOLVED') {
+      await this.eventBus.emit(NotificationType.COMPLAINT_RESOLVED, {
+        complaintId: complaint.id,
+      });
+    } else if (toStatus === 'CLOSED') {
+      await this.eventBus.emit(NotificationType.COMPLAINT_CLOSED, {
+        complaintId: complaint.id,
+      });
+    } else if (toStatus === 'IN_PROGRESS') {
+      await this.eventBus.emit(NotificationType.COMPLAINT_STATUS_CHANGED, {
+        complaintId: complaint.id,
+      });
+    }
     return ComplaintResponseDto.fromEntity(updated);
   }
 
