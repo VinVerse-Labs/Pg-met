@@ -1,15 +1,21 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { RoomType } from '@prisma/client';
+import { RoomAmenity, RoomType } from '@prisma/client';
 import {
+  ArrayMaxSize,
+  ArrayUnique,
+  IsArray,
   IsEnum,
   IsInt,
   IsOptional,
   IsString,
+  IsUrl,
+  Matches,
   Max,
   MaxLength,
   Min,
   MinLength,
 } from 'class-validator';
+import { DECIMAL_PATTERN } from '../../../common/validation/decimal';
 
 // No `status` field - archiving is a deliberate, separately-logged action
 // via DELETE (RoomsService.archive), never a side effect of an unrelated
@@ -44,4 +50,43 @@ export class UpdateRoomDto {
   @Min(1)
   @Max(50)
   capacity?: number;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    example: '7000.00',
+    description:
+      'Advertised monthly price per bed, decimal string (max 2 dp). Informational only - a tenant is billed by their own RentPlan.',
+  })
+  @IsOptional()
+  @IsString()
+  @Matches(DECIMAL_PATTERN, {
+    message:
+      'pricePerBed must be a decimal string with at most 2 decimal places',
+  })
+  pricePerBed?: string | null;
+
+  @ApiProperty({ enum: RoomAmenity, isArray: true, required: false })
+  @IsOptional()
+  @IsArray()
+  @ArrayUnique()
+  @ArrayMaxSize(20)
+  @IsEnum(RoomAmenity, { each: true })
+  amenities?: RoomAmenity[];
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    description: 'Externally hosted http(s) image URL. null removes it.',
+  })
+  @IsOptional()
+  @IsUrl({ require_protocol: true, protocols: ['http', 'https'] })
+  @MaxLength(2048)
+  imageUrl?: string | null;
+
+  @ApiProperty({ required: false, nullable: true, maxLength: 1000 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  description?: string | null;
 }

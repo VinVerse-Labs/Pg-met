@@ -238,8 +238,17 @@ class FakePrisma {
         if (where.status?.not) return b.status !== where.status.not;
         return true;
       }).length,
+    // Phase 13: supports RoomsService.occupancyByRoom's
+    // {roomId: {in}, status: {not}} shape as well as the original {roomId}.
     findMany: async ({ where }: any) =>
-      [...this.beds.values()].filter((b) => b.roomId === where.roomId),
+      [...this.beds.values()].filter((b) => {
+        if (typeof where.roomId === 'string' && b.roomId !== where.roomId)
+          return false;
+        if (where.roomId?.in && !where.roomId.in.includes(b.roomId))
+          return false;
+        if (where.status?.not && b.status === where.status.not) return false;
+        return true;
+      }),
     findFirst: async ({ where }: any) =>
       [...this.beds.values()].find(
         (b) => b.id === where.id && b.roomId === where.roomId,
@@ -249,6 +258,12 @@ class FakePrisma {
       Object.assign(bed, data);
       return bed;
     },
+  };
+
+  // Phase 13: occupancy/history read allocations; this suite never checks
+  // anyone in, so there are none.
+  bedAllocation = {
+    findMany: async () => [],
   };
 
   $transaction = async (fn: (tx: this) => Promise<unknown>) => fn(this);

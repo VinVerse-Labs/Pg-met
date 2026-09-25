@@ -232,6 +232,7 @@ describe('Auth (e2e)', () => {
         .expect(200);
       expect(meResponse.body.data.email).toBe(credentials.email);
       expect(meResponse.body.data.passwordHash).toBeUndefined();
+      expect(meResponse.body.data.platformRole).toBe('USER');
 
       const refreshResponse = await request(server())
         .post('/api/v1/auth/refresh')

@@ -179,6 +179,9 @@ class FakePrisma {
   };
 
   room = {
+    // Phase 13: RoomsService.findAccessible (room list with occupancy).
+    findMany: async ({ where }: any) =>
+      [...this.rooms.values()].filter((r) => r.propertyId === where.propertyId),
     create: async ({ data }: any) => {
       const id = this.nextId();
       const now = new Date();
@@ -217,6 +220,17 @@ class FakePrisma {
   };
 
   bed = {
+    // Phase 13: supports RoomsService.occupancyByRoom's
+    // {roomId: {in}, status: {not}} shape as well as the original {roomId}.
+    findMany: async ({ where }: any) =>
+      [...this.beds.values()].filter((b) => {
+        if (typeof where.roomId === 'string' && b.roomId !== where.roomId)
+          return false;
+        if (where.roomId?.in && !where.roomId.in.includes(b.roomId))
+          return false;
+        if (where.status?.not && b.status === where.status.not) return false;
+        return true;
+      }),
     create: async ({ data }: any) => {
       const id = this.nextId();
       const now = new Date();
@@ -355,6 +369,43 @@ class FakePrisma {
   };
 
   bedAllocation = {
+    // Phase 13: supports {status, bedId: {in}} (occupancy/occupants) and
+    // {bed: {roomId}} (room history), plus the residency -> tenant -> user
+    // and bed includes those queries use. No rent plans exist in this suite.
+    findMany: async ({ where, include, orderBy, take }: any) => {
+      let rows = [...this.bedAllocations.values()].filter((a) => {
+        if (where.status && a.status !== where.status) return false;
+        if (where.bedId?.in && !where.bedId.in.includes(a.bedId)) return false;
+        if (
+          where.bed?.roomId &&
+          this.beds.get(a.bedId)?.roomId !== where.bed.roomId
+        )
+          return false;
+        return true;
+      });
+      if (orderBy?.startDate === 'desc') {
+        rows = rows.sort(
+          (x, y) => +new Date(y.startDate) - +new Date(x.startDate),
+        );
+      }
+      if (take) rows = rows.slice(0, take);
+      if (!include) return rows.map((a) => ({ bedId: a.bedId }));
+      return rows.map((a) => {
+        const residency = this.residencies.get(a.residencyId);
+        const tenant = this.tenants.get(residency.tenantId);
+        const user = this.users.get(tenant.userId);
+        return {
+          ...a,
+          bed: { bedNumber: this.beds.get(a.bedId)?.bedNumber },
+          residency: {
+            id: residency.id,
+            tenantId: residency.tenantId,
+            tenant: { user: { name: user.name, phone: user.phone ?? null } },
+            rentPlans: [],
+          },
+        };
+      });
+    },
     create: async ({ data }: any) => {
       const status = data.status ?? 'ACTIVE';
       if (status === 'ACTIVE') {
@@ -800,6 +851,161 @@ describe('Phase 4: tenants + residency + bed allocation (e2e)', () => {
         .send({ bedId })
         .expect(200);
       expect(res.body.data.allocation.bedId).toBe(bedId);
+    });
+  });
+
+  describe('Phase 13: room details, occupancy, occupants and history', () => {
+    let ownerToken: string;
+    let propertyId: string;
+    let roomId: string;
+    let lowerBedId: string;
+    let residencyId: string;
+    const auth = () => ({ Authorization: `Bearer ${ownerToken}` });
+
+    beforeAll(async () => {
+      const owner = await registerAndLogin('p13owner@example.com');
+      ownerToken = owner.accessToken;
+      const orgId = await createOrg(ownerToken, 'Phase 13 Org');
+      propertyId = await createProperty(ownerToken, orgId);
+
+      const roomRes = await request(server())
+        .post(`/api/v1/properties/${propertyId}/rooms`)
+        .set(auth())
+        .send({
+          roomNumber: '101',
+          roomType: 'TRIPLE',
+          capacity: 3,
+          floor: 1,
+          pricePerBed: '7000',
+          amenities: ['AC', 'WIFI', 'ATTACHED_WASHROOM'],
+          imageUrl: 'https://images.example.com/room-101.jpg',
+          description: 'Spacious room with good ventilation.',
+        })
+        .expect(201);
+      roomId = roomRes.body.data.id;
+
+      const lower = await request(server())
+        .post(`/api/v1/properties/${propertyId}/rooms/${roomId}/beds`)
+        .set(auth())
+        .send({ bedNumber: 'L1', berth: 'LOWER' })
+        .expect(201);
+      lowerBedId = lower.body.data.id;
+      await request(server())
+        .post(`/api/v1/properties/${propertyId}/rooms/${roomId}/beds`)
+        .set(auth())
+        .send({ bedNumber: 'U1', berth: 'UPPER' })
+        .expect(201);
+
+      const tenantUser = await registerAndLogin('p13tenant@example.com');
+      const tenantId = await createTenant(tenantUser.accessToken);
+      const residency = await request(server())
+        .post(`/api/v1/properties/${propertyId}/residencies`)
+        .set(auth())
+        .send({ tenantId, startDate: '2027-01-01T00:00:00.000Z' })
+        .expect(201);
+      residencyId = residency.body.data.id;
+      await request(server())
+        .post(`/api/v1/residencies/${residencyId}/check-in`)
+        .set(auth())
+        .send({ bedId: lowerBedId })
+        .expect(200);
+    });
+
+    it('returns room details and exact per-room occupancy in the room list', async () => {
+      const res = await request(server())
+        .get(`/api/v1/properties/${propertyId}/rooms`)
+        .set(auth())
+        .expect(200);
+      const room = res.body.data.find((r: any) => r.id === roomId);
+      expect(room).toMatchObject({
+        pricePerBed: '7000.00',
+        currency: 'INR',
+        amenities: ['AC', 'WIFI', 'ATTACHED_WASHROOM'],
+        imageUrl: 'https://images.example.com/room-101.jpg',
+        description: 'Spacious room with good ventilation.',
+        occupancy: {
+          totalBeds: 2,
+          occupiedBeds: 1,
+          vacantBeds: 1,
+          blockedBeds: 0,
+        },
+      });
+    });
+
+    it('shows the current occupant on the occupied bed only, with berth', async () => {
+      const res = await request(server())
+        .get(`/api/v1/properties/${propertyId}/rooms/${roomId}/beds`)
+        .set(auth())
+        .expect(200);
+      const lower = res.body.data.find((b: any) => b.bedNumber === 'L1');
+      const upper = res.body.data.find((b: any) => b.bedNumber === 'U1');
+      expect(lower.berth).toBe('LOWER');
+      expect(lower.occupant).toMatchObject({
+        residencyId,
+        name: 'Test User',
+        monthlyRent: null,
+      });
+      expect(upper.berth).toBe('UPPER');
+      expect(upper.occupant).toBeNull();
+    });
+
+    it('lists the check-in in room history, and the check-out after it ends', async () => {
+      const before = await request(server())
+        .get(`/api/v1/properties/${propertyId}/rooms/${roomId}/history`)
+        .set(auth())
+        .expect(200);
+      expect(before.body.data).toEqual([
+        expect.objectContaining({
+          bedNumber: 'L1',
+          residencyId,
+          tenantName: 'Test User',
+          status: 'ACTIVE',
+          endDate: null,
+        }),
+      ]);
+
+      await request(server())
+        .post(`/api/v1/residencies/${residencyId}/check-out`)
+        .set(auth())
+        .send({})
+        .expect(200);
+
+      const after = await request(server())
+        .get(`/api/v1/properties/${propertyId}/rooms/${roomId}/history`)
+        .set(auth())
+        .expect(200);
+      expect(after.body.data[0]).toMatchObject({ status: 'ENDED' });
+      expect(after.body.data[0].endDate).not.toBeNull();
+
+      const rooms = await request(server())
+        .get(`/api/v1/properties/${propertyId}/rooms`)
+        .set(auth())
+        .expect(200);
+      expect(
+        rooms.body.data.find((r: any) => r.id === roomId).occupancy,
+      ).toMatchObject({ occupiedBeds: 0, vacantBeds: 2 });
+    });
+
+    it.each([
+      [{ pricePerBed: 'abc' }],
+      [{ pricePerBed: '100.555' }],
+      [{ imageUrl: 'javascript:alert(1)' }],
+      [{ amenities: ['SWIMMING_POOL'] }],
+      [{ amenities: ['AC', 'AC'] }],
+    ])('rejects invalid room details %o with 400', async (patch) => {
+      await request(server())
+        .patch(`/api/v1/properties/${propertyId}/rooms/${roomId}`)
+        .set(auth())
+        .send(patch)
+        .expect(400);
+    });
+
+    it('404s room history for a user outside the organization', async () => {
+      const outsider = await registerAndLogin('p13outsider@example.com');
+      await request(server())
+        .get(`/api/v1/properties/${propertyId}/rooms/${roomId}/history`)
+        .set('Authorization', `Bearer ${outsider.accessToken}`)
+        .expect(404);
     });
   });
 

@@ -1,5 +1,5 @@
 import { HttpStatus, Injectable, Logger } from '@nestjs/common';
-import { Bed, MembershipRole } from '@prisma/client';
+import { Bed, MembershipRole, Prisma } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import { AppException } from '../../common/exceptions/app.exception';
 import { ErrorCode } from '../../common/constants/error-code.enum';
@@ -9,7 +9,7 @@ import { RoomsService } from '../rooms/rooms.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { CreateBedDto } from './dto/create-bed.dto';
 import { UpdateBedDto } from './dto/update-bed.dto';
-import { BedResponseDto } from './dto/bed-response.dto';
+import { BedOccupantDto, BedResponseDto } from './dto/bed-response.dto';
 
 const CREATE_UPDATE_ROLES: MembershipRole[] = ['OWNER', 'MANAGER'];
 
@@ -86,7 +86,7 @@ export class BedsService {
       }
 
       const bed = await tx.bed.create({
-        data: { roomId, bedNumber: dto.bedNumber },
+        data: { roomId, bedNumber: dto.bedNumber, berth: dto.berth },
       });
       this.logger.log(`BED_CREATED bed=${bed.id} room=${roomId} by=${user.id}`);
       return BedResponseDto.fromEntity(bed);
@@ -105,7 +105,10 @@ export class BedsService {
       where: { roomId },
       orderBy: { createdAt: 'desc' },
     });
-    return beds.map(BedResponseDto.fromEntity);
+    const occupants = await this.occupantsByBed(beds.map((b) => b.id));
+    return beds.map((bed) =>
+      BedResponseDto.fromEntity(bed, occupants.get(bed.id) ?? null),
+    );
   }
 
   async findOne(
@@ -120,7 +123,8 @@ export class BedsService {
       roomId,
       bedId,
     );
-    return BedResponseDto.fromEntity(bed);
+    const occupants = await this.occupantsByBed([bed.id]);
+    return BedResponseDto.fromEntity(bed, occupants.get(bed.id) ?? null);
   }
 
   async update(
@@ -142,7 +146,11 @@ export class BedsService {
       where: { id: bed.id },
       data: dto,
     });
-    return BedResponseDto.fromEntity(updated);
+    const occupants = await this.occupantsByBed([updated.id]);
+    return BedResponseDto.fromEntity(
+      updated,
+      occupants.get(updated.id) ?? null,
+    );
   }
 
   // OWNER-only soft archive - identical convention to Property/Room.
@@ -213,5 +221,48 @@ export class BedsService {
       organizationId,
     );
     this.memberships.assertRole(user, membership, allowedRoles);
+  }
+
+  // Phase 13: one query for any number of beds - ACTIVE allocations with
+  // the tenant's name/phone and their current ACTIVE rent plan.
+  private async occupantsByBed(
+    bedIds: string[],
+  ): Promise<Map<string, BedOccupantDto>> {
+    const result = new Map<string, BedOccupantDto>();
+    if (bedIds.length === 0) return result;
+    const allocations = await this.prisma.bedAllocation.findMany({
+      where: { status: 'ACTIVE', bedId: { in: bedIds } },
+      include: {
+        residency: {
+          select: {
+            id: true,
+            tenantId: true,
+            tenant: {
+              select: { user: { select: { name: true, phone: true } } },
+            },
+            rentPlans: {
+              where: { status: 'ACTIVE' },
+              orderBy: { effectiveFrom: 'desc' },
+              take: 1,
+              select: { amount: true, currency: true },
+            },
+          },
+        },
+      },
+    });
+    for (const allocation of allocations) {
+      const residency = allocation.residency;
+      const plan = residency.rentPlans[0];
+      result.set(allocation.bedId, {
+        residencyId: residency.id,
+        tenantId: residency.tenantId,
+        name: residency.tenant.user.name,
+        phone: residency.tenant.user.phone ?? null,
+        since: allocation.startDate,
+        monthlyRent: plan ? new Prisma.Decimal(plan.amount).toFixed(2) : null,
+        currency: plan?.currency ?? null,
+      });
+    }
+    return result;
   }
 }

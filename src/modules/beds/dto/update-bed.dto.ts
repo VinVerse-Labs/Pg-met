@@ -1,6 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { BedStatus } from '@prisma/client';
+import { BedBerth, BedStatus } from '@prisma/client';
 import {
+  IsEnum,
   IsIn,
   IsOptional,
   IsString,
@@ -25,4 +26,14 @@ export class UpdateBedDto {
   @IsOptional()
   @IsIn(['AVAILABLE', 'INACTIVE'] satisfies BedStatus[])
   status?: 'AVAILABLE' | 'INACTIVE';
+
+  @ApiProperty({
+    enum: BedBerth,
+    required: false,
+    nullable: true,
+    description: 'LOWER/UPPER for bunk beds; null makes it a regular bed.',
+  })
+  @IsOptional()
+  @IsEnum(BedBerth)
+  berth?: BedBerth | null;
 }

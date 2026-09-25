@@ -1,5 +1,12 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsString, MaxLength, MinLength } from 'class-validator';
+import { BedBerth } from '@prisma/client';
+import {
+  IsEnum,
+  IsOptional,
+  IsString,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 
 // No roomId/propertyId field - both come from the URL (POST
 // /properties/:propertyId/rooms/:roomId/beds), never the body. See
@@ -14,4 +21,13 @@ export class CreateBedDto {
   @MinLength(1)
   @MaxLength(20)
   bedNumber!: string;
+
+  @ApiProperty({
+    enum: BedBerth,
+    required: false,
+    description: 'LOWER/UPPER for bunk beds; omit for a regular bed.',
+  })
+  @IsOptional()
+  @IsEnum(BedBerth)
+  berth?: BedBerth;
 }

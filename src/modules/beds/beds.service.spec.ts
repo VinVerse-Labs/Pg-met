@@ -36,6 +36,7 @@ describe('BedsService', () => {
       findFirst: jest.Mock;
       update: jest.Mock;
     };
+    bedAllocation: { findMany: jest.Mock };
     $transaction: jest.Mock;
   };
   let memberships: {
@@ -53,6 +54,7 @@ describe('BedsService', () => {
         findFirst: jest.fn(),
         update: jest.fn(),
       },
+      bedAllocation: { findMany: jest.fn().mockResolvedValue([]) },
       $transaction: jest.fn(),
     };
     memberships = { getActiveMembership: jest.fn(), assertRole: jest.fn() };
@@ -270,6 +272,69 @@ describe('BedsService', () => {
         where: { id: 'bed-1' },
         data: { status: 'ARCHIVED' },
       });
+    });
+  });
+
+  describe('Phase 13: occupants', () => {
+    it('attaches the current occupant (name, phone, rent) to occupied beds only, in one query', async () => {
+      rooms.getAccessibleRoomOrThrow.mockResolvedValue({
+        id: 'room-1',
+        propertyId: 'prop-1',
+        organizationId: 'org-1',
+      });
+      prisma.bed.findMany.mockResolvedValue([
+        {
+          id: 'b1',
+          roomId: 'room-1',
+          bedNumber: 'L1',
+          status: 'AVAILABLE',
+          berth: 'LOWER',
+          createdAt: new Date(),
+        },
+        {
+          id: 'b2',
+          roomId: 'room-1',
+          bedNumber: 'U1',
+          status: 'AVAILABLE',
+          berth: 'UPPER',
+          createdAt: new Date(),
+        },
+      ]);
+      prisma.bedAllocation.findMany.mockResolvedValue([
+        {
+          bedId: 'b1',
+          startDate: new Date('2026-08-01'),
+          residency: {
+            id: 'res-1',
+            tenantId: 't1',
+            tenant: { user: { name: 'Rohit S.', phone: '9876500000' } },
+            rentPlans: [{ amount: '7000', currency: 'INR' }],
+          },
+        },
+      ]);
+
+      const [lower, upper] = await service.findAccessible(
+        buildUser(),
+        'prop-1',
+        'room-1',
+      );
+
+      expect(prisma.bedAllocation.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.bedAllocation.findMany.mock.calls[0][0].where).toEqual({
+        status: 'ACTIVE',
+        bedId: { in: ['b1', 'b2'] },
+      });
+      expect(lower.berth).toBe('LOWER');
+      expect(lower.occupant).toEqual({
+        residencyId: 'res-1',
+        tenantId: 't1',
+        name: 'Rohit S.',
+        phone: '9876500000',
+        since: new Date('2026-08-01'),
+        monthlyRent: '7000.00',
+        currency: 'INR',
+      });
+      expect(upper.occupant).toBeNull();
     });
   });
 });

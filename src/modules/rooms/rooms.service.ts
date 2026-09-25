@@ -8,7 +8,12 @@ import { PropertiesService } from '../properties/properties.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { UpdateRoomDto } from './dto/update-room.dto';
-import { RoomResponseDto } from './dto/room-response.dto';
+import {
+  EMPTY_OCCUPANCY,
+  RoomOccupancyDto,
+  RoomResponseDto,
+} from './dto/room-response.dto';
+import { RoomHistoryEntryDto } from './dto/room-history.dto';
 
 // Same role split as PropertiesService: MANAGER handles day-to-day
 // inventory setup, archiving is OWNER-only (bigger blast radius - it
@@ -68,6 +73,10 @@ export class RoomsService {
         floor: dto.floor,
         roomType: dto.roomType,
         capacity: dto.capacity,
+        pricePerBed: dto.pricePerBed,
+        amenities: dto.amenities ?? [],
+        imageUrl: dto.imageUrl,
+        description: dto.description,
       },
     });
 
@@ -92,7 +101,10 @@ export class RoomsService {
       where: { propertyId },
       orderBy: { createdAt: 'desc' },
     });
-    return rooms.map(RoomResponseDto.fromEntity);
+    const occupancy = await this.occupancyByRoom(rooms.map((r) => r.id));
+    return rooms.map((room) =>
+      RoomResponseDto.fromEntity(room, occupancy.get(room.id)),
+    );
   }
 
   async findOne(
@@ -101,7 +113,35 @@ export class RoomsService {
     roomId: string,
   ): Promise<RoomResponseDto> {
     const room = await this.getAccessibleRoomOrThrow(user, propertyId, roomId);
-    return RoomResponseDto.fromEntity(room);
+    const occupancy = await this.occupancyByRoom([room.id]);
+    return RoomResponseDto.fromEntity(room, occupancy.get(room.id));
+  }
+
+  // Phase 13: bed-allocation history (check-ins and check-outs) for the
+  // beds in one room, newest first. Visible to any active member who can
+  // see the room - the same audience that can already list the property's
+  // residencies. Capped at 100 entries.
+  async history(
+    user: AuthenticatedUser,
+    propertyId: string,
+    roomId: string,
+  ): Promise<RoomHistoryEntryDto[]> {
+    await this.getAccessibleRoomOrThrow(user, propertyId, roomId);
+    const allocations = await this.prisma.bedAllocation.findMany({
+      where: { bed: { roomId } },
+      orderBy: { startDate: 'desc' },
+      take: 100,
+      include: {
+        bed: { select: { bedNumber: true } },
+        residency: {
+          select: {
+            tenantId: true,
+            tenant: { select: { user: { select: { name: true } } } },
+          },
+        },
+      },
+    });
+    return allocations.map(RoomHistoryEntryDto.fromEntity);
   }
 
   async update(
@@ -122,7 +162,7 @@ export class RoomsService {
         where: { id: roomId },
         data: dto,
       });
-      return RoomResponseDto.fromEntity(updated);
+      return this.withOccupancy(updated);
     }
 
     // Reducing capacity: must not drop below the room's current
@@ -132,24 +172,25 @@ export class RoomsService {
     // new bed in between this count and the update; one of the two
     // transactions always waits for the other's lock to release before it
     // can even read a consistent count.
-    return this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM rooms WHERE id = ${roomId} FOR UPDATE`;
-      const activeBedCount = await tx.bed.count({
-        where: { roomId, status: { not: 'ARCHIVED' } },
-      });
-      if (dto.capacity! < activeBedCount) {
-        throw new AppException(
-          ErrorCode.ROOM_CAPACITY_BELOW_BED_COUNT,
-          `Cannot reduce capacity below the current number of beds (${activeBedCount}).`,
-          HttpStatus.CONFLICT,
-        );
-      }
-      const updated = await tx.room.update({
-        where: { id: roomId },
-        data: dto,
-      });
-      return RoomResponseDto.fromEntity(updated);
-    });
+    return this.prisma
+      .$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM rooms WHERE id = ${roomId} FOR UPDATE`;
+        const activeBedCount = await tx.bed.count({
+          where: { roomId, status: { not: 'ARCHIVED' } },
+        });
+        if (dto.capacity! < activeBedCount) {
+          throw new AppException(
+            ErrorCode.ROOM_CAPACITY_BELOW_BED_COUNT,
+            `Cannot reduce capacity below the current number of beds (${activeBedCount}).`,
+            HttpStatus.CONFLICT,
+          );
+        }
+        return tx.room.update({
+          where: { id: roomId },
+          data: dto,
+        });
+      })
+      .then((updated) => this.withOccupancy(updated));
   }
 
   // OWNER-only, soft archive - see spec section 13. A room accumulates
@@ -168,7 +209,7 @@ export class RoomsService {
       data: { status: 'ARCHIVED' },
     });
     this.logger.log(`ROOM_ARCHIVED room=${roomId} by=${user.id}`);
-    return RoomResponseDto.fromEntity(archived);
+    return this.withOccupancy(archived);
   }
 
   // The BOLA/IDOR defense for the Room level of the chain, and the seam
@@ -206,6 +247,45 @@ export class RoomsService {
     }
     const { property, ...roomFields } = room;
     return { ...roomFields, organizationId: property.organizationId };
+  }
+
+  private async withOccupancy(room: Room): Promise<RoomResponseDto> {
+    const occupancy = await this.occupancyByRoom([room.id]);
+    return RoomResponseDto.fromEntity(room, occupancy.get(room.id));
+  }
+
+  // Two queries for any number of rooms (never one per room): the rooms'
+  // non-archived beds, then which of those beds hold an ACTIVE allocation.
+  private async occupancyByRoom(
+    roomIds: string[],
+  ): Promise<Map<string, RoomOccupancyDto>> {
+    const result = new Map<string, RoomOccupancyDto>();
+    if (roomIds.length === 0) return result;
+
+    const beds = await this.prisma.bed.findMany({
+      where: { roomId: { in: roomIds }, status: { not: 'ARCHIVED' } },
+      select: { id: true, roomId: true, status: true },
+    });
+    const occupiedBedIds = new Set(
+      beds.length === 0
+        ? []
+        : (
+            await this.prisma.bedAllocation.findMany({
+              where: { status: 'ACTIVE', bedId: { in: beds.map((b) => b.id) } },
+              select: { bedId: true },
+            })
+          ).map((a) => a.bedId),
+    );
+
+    for (const roomId of roomIds) result.set(roomId, { ...EMPTY_OCCUPANCY });
+    for (const bed of beds) {
+      const summary = result.get(bed.roomId)!;
+      summary.totalBeds += 1;
+      if (occupiedBedIds.has(bed.id)) summary.occupiedBeds += 1;
+      else if (bed.status === 'AVAILABLE') summary.vacantBeds += 1;
+      else summary.blockedBeds += 1;
+    }
+    return result;
   }
 
   private async assertRoleForProperty(

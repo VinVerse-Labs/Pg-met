@@ -33,6 +33,8 @@ describe('RoomsService', () => {
       findFirst: jest.Mock;
       update: jest.Mock;
     };
+    bed: { findMany: jest.Mock };
+    bedAllocation: { findMany: jest.Mock };
     $transaction: jest.Mock;
   };
   let memberships: {
@@ -50,6 +52,8 @@ describe('RoomsService', () => {
         findFirst: jest.fn(),
         update: jest.fn(),
       },
+      bed: { findMany: jest.fn().mockResolvedValue([]) },
+      bedAllocation: { findMany: jest.fn().mockResolvedValue([]) },
       $transaction: jest.fn(),
     };
     memberships = {
@@ -356,6 +360,130 @@ describe('RoomsService', () => {
         where: { id: 'room-1' },
         data: { status: 'ARCHIVED' },
       });
+    });
+  });
+
+  describe('Phase 13: occupancy and history', () => {
+    beforeEach(() => {
+      properties.getAccessiblePropertyOrThrow.mockResolvedValue({
+        id: 'prop-1',
+        organizationId: 'org-1',
+        status: 'ACTIVE',
+      });
+      memberships.listActiveOrganizationIds.mockResolvedValue(['org-1']);
+    });
+
+    it('computes per-room occupancy from beds + ACTIVE allocations in two queries (not per room)', async () => {
+      prisma.room.findMany.mockResolvedValue([
+        {
+          id: 'r1',
+          propertyId: 'prop-1',
+          roomNumber: '101',
+          floor: 1,
+          roomType: 'TRIPLE',
+          capacity: 3,
+          status: 'ACTIVE',
+          pricePerBed: '7000',
+          currency: 'INR',
+          amenities: ['AC', 'WIFI'],
+          imageUrl: null,
+          description: null,
+          createdAt: new Date(),
+        },
+        {
+          id: 'r2',
+          propertyId: 'prop-1',
+          roomNumber: '102',
+          floor: 1,
+          roomType: 'SINGLE',
+          capacity: 1,
+          status: 'ACTIVE',
+          pricePerBed: null,
+          currency: 'INR',
+          amenities: [],
+          imageUrl: null,
+          description: null,
+          createdAt: new Date(),
+        },
+      ]);
+      prisma.bed.findMany.mockResolvedValue([
+        { id: 'b1', roomId: 'r1', status: 'AVAILABLE' },
+        { id: 'b2', roomId: 'r1', status: 'AVAILABLE' },
+        { id: 'b3', roomId: 'r1', status: 'INACTIVE' },
+      ]);
+      prisma.bedAllocation.findMany.mockResolvedValue([{ bedId: 'b1' }]);
+
+      const [r1, r2] = await service.findAccessible(buildUser(), 'prop-1');
+
+      expect(prisma.bed.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.bed.findMany.mock.calls[0][0].where).toEqual({
+        roomId: { in: ['r1', 'r2'] },
+        status: { not: 'ARCHIVED' },
+      });
+      expect(prisma.bedAllocation.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.bedAllocation.findMany.mock.calls[0][0].where).toEqual({
+        status: 'ACTIVE',
+        bedId: { in: ['b1', 'b2', 'b3'] },
+      });
+      expect(r1.occupancy).toEqual({
+        totalBeds: 3,
+        occupiedBeds: 1,
+        vacantBeds: 1,
+        blockedBeds: 1,
+      });
+      expect(r1.pricePerBed).toBe('7000.00');
+      expect(r1.amenities).toEqual(['AC', 'WIFI']);
+      expect(r2.occupancy).toEqual({
+        totalBeds: 0,
+        occupiedBeds: 0,
+        vacantBeds: 0,
+        blockedBeds: 0,
+      });
+      expect(r2.pricePerBed).toBeNull();
+    });
+
+    it('returns allocation history for the room, scoped through the accessible-room check', async () => {
+      prisma.room.findFirst.mockResolvedValue({
+        id: 'r1',
+        propertyId: 'prop-1',
+        property: { organizationId: 'org-1' },
+      });
+      prisma.bedAllocation.findMany.mockResolvedValue([
+        {
+          id: 'a1',
+          bedId: 'b1',
+          residencyId: 'res-1',
+          status: 'ENDED',
+          startDate: new Date('2026-08-01'),
+          endDate: new Date('2026-09-01'),
+          bed: { bedNumber: 'L1' },
+          residency: { tenantId: 't1', tenant: { user: { name: 'Rohit S.' } } },
+        },
+      ]);
+
+      const history = await service.history(buildUser(), 'prop-1', 'r1');
+
+      expect(prisma.bedAllocation.findMany.mock.calls[0][0]).toMatchObject({
+        where: { bed: { roomId: 'r1' } },
+        take: 100,
+        orderBy: { startDate: 'desc' },
+      });
+      expect(history).toEqual([
+        expect.objectContaining({
+          allocationId: 'a1',
+          bedNumber: 'L1',
+          tenantName: 'Rohit S.',
+          status: 'ENDED',
+        }),
+      ]);
+    });
+
+    it("404s history for a room outside the caller's organizations", async () => {
+      prisma.room.findFirst.mockResolvedValue(null);
+      await expect(
+        service.history(buildUser(), 'prop-1', 'r-other'),
+      ).rejects.toMatchObject({ status: 404 });
+      expect(prisma.bedAllocation.findMany).not.toHaveBeenCalled();
     });
   });
 });

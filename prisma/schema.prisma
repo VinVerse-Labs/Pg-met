@@ -129,6 +129,29 @@ enum BedStatus {
   ARCHIVED
 }
 
+// Phase 13: in-room features an owner advertises per room. Deliberately a
+// separate enum from Amenity (which describes the whole property on its
+// public listing - parking, gym, laundry). "Non-AC" is simply the absence
+// of AC, not its own value.
+enum RoomAmenity {
+  AC
+  WIFI
+  TV
+  FAN
+  ALMARI
+  STUDY_TABLE
+  ATTACHED_WASHROOM
+  GEYSER
+  BALCONY
+}
+
+// Phase 13: optional position for bunk-bed layouts. Null means a regular
+// (non-bunk) bed.
+enum BedBerth {
+  LOWER
+  UPPER
+}
+
 // PENDING is the state a Residency is created in - a tenant has been
 // scheduled to move into a property, but check-in (which assigns a bed via
 // BedAllocation) hasn't happened yet. This is deliberately a separate step
@@ -744,6 +767,16 @@ model Room {
   capacity   Int
   status     RoomStatus @default(ACTIVE)
 
+  // Phase 13 room details. pricePerBed is the *advertised* monthly rate per
+  // bed - informational for owners and search; what a tenant actually pays
+  // is still their own RentPlan (never derived from this). imageUrl is an
+  // externally hosted http(s) image; there is no file-upload service yet.
+  pricePerBed Decimal?      @db.Decimal(12, 2)
+  currency    String        @default("INR")
+  amenities   RoomAmenity[] @default([])
+  imageUrl    String?
+  description String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -764,6 +797,7 @@ model Bed {
   room      Room      @relation(fields: [roomId], references: [id], onDelete: Cascade)
   bedNumber String
   status    BedStatus @default(AVAILABLE)
+  berth     BedBerth?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

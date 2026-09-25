@@ -23,6 +23,7 @@ import { RoomsService } from './rooms.service';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { UpdateRoomDto } from './dto/update-room.dto';
 import { RoomResponseDto } from './dto/room-response.dto';
+import { RoomHistoryEntryDto } from './dto/room-history.dto';
 
 // Nested under /properties/:propertyId (no separate top-level /rooms route)
 // - a room is meaningless outside the property it belongs to, and nesting
@@ -71,6 +72,20 @@ export class RoomsController {
     @Param('roomId') roomId: string,
   ): Promise<RoomResponseDto> {
     return this.roomsService.findOne(user, propertyId, roomId);
+  }
+
+  @Get(':roomId/history')
+  @ApiOperation({
+    summary:
+      "Bed-allocation history (check-ins/check-outs) for a room's beds, newest first, max 100. Any active member who can see the room.",
+  })
+  @ApiResponse({ status: 200, type: [RoomHistoryEntryDto] })
+  async history(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('propertyId') propertyId: string,
+    @Param('roomId') roomId: string,
+  ): Promise<RoomHistoryEntryDto[]> {
+    return this.roomsService.history(user, propertyId, roomId);
   }
 
   @Patch(':roomId')
