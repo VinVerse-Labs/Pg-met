@@ -18,6 +18,12 @@ export const envValidationSchema = Joi.object({
 
   CORS_ORIGINS: Joi.string().allow('').default(''),
 
+  // Number of reverse-proxy hops to trust for the client IP (Express
+  // 'trust proxy'). Behind Render/any load balancer this must be set (1),
+  // otherwise every client shares the proxy's IP - one rate-limit bucket
+  // for all users. 0 = trust none (direct exposure, local dev).
+  TRUST_PROXY_HOPS: Joi.number().integer().min(0).max(10).default(0),
+
   // Razorpay (Phase 6). Not required outside of endpoints that actually
   // call the gateway, but validated up front like every other secret in
   // this project - a missing key should fail at startup, not on the first

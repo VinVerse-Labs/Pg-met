@@ -5,6 +5,7 @@ import { FoodEntitlementService } from './food-entitlement.service';
 import { FoodMenusService } from './food-menus.service';
 import { FoodSubscriptionsService } from './food-subscriptions.service';
 import { MyFoodResponseDto } from '../dto/my-food-response.dto';
+import { calendarDateInTimeZone } from '../../../common/validation/calendar';
 
 // Orchestrates the other food services into the one tenant-dashboard
 // payload (spec section 30/92: "the backend is the source of truth") -
@@ -28,13 +29,19 @@ export class MyFoodService {
       context.property.id,
     );
 
-    const todayDate = new Date().toISOString().slice(0, 10);
+    // "Today" at the property, not in UTC (see common/validation/calendar).
+    const todayDate = calendarDateInTimeZone(
+      new Date(),
+      context.property.timezone,
+    );
     const todayMenu = config.enabled
       ? await this.menus.findOneForDate(context.property.id, todayDate, true)
       : null;
 
     const dto = new MyFoodResponseDto();
     dto.enabled = config.enabled;
+    dto.todayDate = todayDate;
+    dto.timezone = context.property.timezone;
     dto.entitlement = entitlement;
     dto.today = todayMenu
       ? {

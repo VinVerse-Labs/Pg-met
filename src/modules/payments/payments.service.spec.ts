@@ -1,6 +1,8 @@
+import { HttpStatus } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { ErrorCode } from '../../common/constants/error-code.enum';
+import { AppException } from '../../common/exceptions/app.exception';
 import { MembershipsService } from '../memberships/memberships.service';
 import { PlatformFeeService } from './platform-fee.service';
 import { PaymentGateway } from './gateway/payment-gateway.interface';
@@ -206,6 +208,123 @@ describe('PaymentsService', () => {
       ).rejects.toMatchObject({
         code: ErrorCode.AMOUNT_EXCEEDS_OUTSTANDING_BALANCE,
       });
+    });
+
+    it('hands back an open unpaid order for the same amount instead of creating a second one', async () => {
+      prisma.invoice.findFirst.mockResolvedValue(buildInvoiceRow());
+      prisma.paymentAllocation.aggregate.mockResolvedValue({
+        _sum: { amount: null },
+      });
+      prisma.payment.findFirst.mockResolvedValue(
+        buildPaymentRow({ status: 'PENDING', providerOrderId: 'order_open' }),
+      );
+
+      const result = await service.createOrder(
+        buildUser(),
+        'inv-1',
+        { amount: '4000.00' },
+        'a-new-key-from-another-tab',
+      );
+
+      expect(result.providerOrderId).toBe('order_open');
+      expect(prisma.payment.create).not.toHaveBeenCalled();
+      expect(gateway.createOrder).not.toHaveBeenCalled();
+      expect(prisma.payment.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            invoiceId: 'inv-1',
+            payerUserId: buildUser().id,
+          }),
+        }),
+      );
+    });
+
+    it('refuses a new order while a recent payment is AUTHORIZED (still settling)', async () => {
+      prisma.invoice.findFirst.mockResolvedValue(buildInvoiceRow());
+      prisma.paymentAllocation.aggregate.mockResolvedValue({
+        _sum: { amount: null },
+      });
+      prisma.payment.findFirst.mockResolvedValue(
+        buildPaymentRow({ status: 'AUTHORIZED', updatedAt: new Date() }),
+      );
+
+      await expect(
+        service.createOrder(buildUser(), 'inv-1', { amount: '4000.00' }),
+      ).rejects.toMatchObject({ code: ErrorCode.PAYMENT_IN_PROGRESS });
+      expect(prisma.payment.create).not.toHaveBeenCalled();
+    });
+
+    it('allows a new order once an AUTHORIZED payment is older than the hold window', async () => {
+      prisma.invoice.findFirst.mockResolvedValue(buildInvoiceRow());
+      prisma.paymentAllocation.aggregate.mockResolvedValue({
+        _sum: { amount: null },
+      });
+      prisma.payment.findFirst.mockResolvedValue(
+        buildPaymentRow({
+          status: 'AUTHORIZED',
+          updatedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+        }),
+      );
+      platformFee.calculateFee.mockResolvedValue(new Prisma.Decimal('1.00'));
+      prisma.payment.create.mockResolvedValue(
+        buildPaymentRow({ providerOrderId: null, status: 'CREATED' }),
+      );
+      gateway.createOrder.mockResolvedValue({ providerOrderId: 'order_new' });
+      prisma.payment.update.mockResolvedValue(
+        buildPaymentRow({ providerOrderId: 'order_new' }),
+      );
+
+      const result = await service.createOrder(buildUser(), 'inv-1', {
+        amount: '4000.00',
+      });
+      expect(result.providerOrderId).toBe('order_new');
+    });
+
+    it('closes the payment as FAILED when the gateway cannot create the order (no orphan CREATED row)', async () => {
+      prisma.invoice.findFirst.mockResolvedValue(buildInvoiceRow());
+      prisma.paymentAllocation.aggregate.mockResolvedValue({
+        _sum: { amount: null },
+      });
+      platformFee.calculateFee.mockResolvedValue(new Prisma.Decimal('1.00'));
+      prisma.payment.create.mockResolvedValue(
+        buildPaymentRow({ providerOrderId: null, status: 'CREATED' }),
+      );
+      gateway.createOrder.mockRejectedValue(
+        new AppException(
+          ErrorCode.PAYMENT_GATEWAY_ERROR,
+          'Could not create a payment order with the gateway.',
+          HttpStatus.BAD_GATEWAY,
+        ),
+      );
+
+      await expect(
+        service.createOrder(buildUser(), 'inv-1', { amount: '4000.00' }),
+      ).rejects.toMatchObject({ code: ErrorCode.PAYMENT_GATEWAY_ERROR });
+      expect(prisma.payment.update).toHaveBeenCalledWith({
+        where: { id: 'pay-1' },
+        data: expect.objectContaining({
+          status: 'FAILED',
+          failureCode: 'GATEWAY_ORDER_FAILED',
+        }),
+      });
+    });
+
+    it('never replays an idempotent attempt that has no gateway order', async () => {
+      prisma.payment.findUnique.mockResolvedValue(
+        buildPaymentRow({
+          idempotencyKey: 'idem-x',
+          providerOrderId: null,
+          status: 'FAILED',
+        }),
+      );
+      await expect(
+        service.createOrder(
+          buildUser(),
+          'inv-1',
+          { amount: '4000.00' },
+          'idem-x',
+        ),
+      ).rejects.toMatchObject({ code: ErrorCode.PAYMENT_GATEWAY_ERROR });
     });
 
     it('returns the existing order for a repeated Idempotency-Key instead of creating a new one', async () => {

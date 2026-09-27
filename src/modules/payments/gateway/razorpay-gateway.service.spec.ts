@@ -94,3 +94,41 @@ describe('RazorpayGatewayService (signature verification)', () => {
     });
   });
 });
+
+describe('RazorpayGatewayService.fetchPayment', () => {
+  function withFetch(fetch: jest.Mock) {
+    const service = new RazorpayGatewayService(configService());
+    (service as any).client = { payments: { fetch } };
+    return service;
+  }
+
+  it('retries once on a connection-level failure (no HTTP response)', async () => {
+    const fetch = jest
+      .fn()
+      .mockRejectedValueOnce(
+        new TypeError("Cannot read properties of undefined (reading 'status')"),
+      )
+      .mockResolvedValueOnce({ status: 'captured', method: 'netbanking' });
+    const result = await withFetch(fetch).fetchPayment('pay_1');
+    expect(result).toEqual({ status: 'captured', method: 'netbanking' });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a real Razorpay error response', async () => {
+    const fetch = jest
+      .fn()
+      .mockRejectedValue({ statusCode: 400, error: { code: 'BAD_REQUEST' } });
+    await expect(withFetch(fetch).fetchPayment('pay_1')).rejects.toMatchObject({
+      code: 'PAYMENT_GATEWAY_ERROR',
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up after the single retry', async () => {
+    const fetch = jest.fn().mockRejectedValue(new TypeError('socket hang up'));
+    await expect(withFetch(fetch).fetchPayment('pay_1')).rejects.toMatchObject({
+      code: 'PAYMENT_GATEWAY_ERROR',
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+});

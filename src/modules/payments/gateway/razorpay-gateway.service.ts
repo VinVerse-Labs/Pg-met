@@ -90,7 +90,7 @@ export class RazorpayGatewayService implements PaymentGateway {
     providerPaymentId: string,
   ): Promise<FetchGatewayPaymentResult> {
     try {
-      const payment = await this.client.payments.fetch(providerPaymentId);
+      const payment = await this.fetchWithOneRetry(providerPaymentId);
       return { status: payment.status, method: payment.method };
     } catch (error) {
       this.logger.error(`RAZORPAY_FETCH_PAYMENT_FAILED ${String(error)}`);
@@ -99,6 +99,29 @@ export class RazorpayGatewayService implements PaymentGateway {
         'Could not fetch payment status from the gateway.',
         HttpStatus.BAD_GATEWAY,
       );
+    }
+  }
+
+  // A read, so safe to repeat. Measured against Razorpay's test API: the SDK
+  // intermittently fails with a connection-level error (no HTTP response -
+  // it surfaces as "Cannot read properties of undefined (reading 'status')"),
+  // which made a valid, possibly-captured payment's verify a 502. Only that
+  // no-response case is retried, once; a real Razorpay error response (it
+  // carries a statusCode) is not.
+  private async fetchWithOneRetry(
+    providerPaymentId: string,
+  ): Promise<{ status: string; method?: string }> {
+    try {
+      return await this.client.payments.fetch(providerPaymentId);
+    } catch (error) {
+      const hasResponse =
+        typeof (error as { statusCode?: unknown })?.statusCode === 'number';
+      if (hasResponse) throw error;
+      this.logger.warn(
+        `RAZORPAY_FETCH_PAYMENT_RETRY payment=${providerPaymentId} ${String(error)}`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      return this.client.payments.fetch(providerPaymentId);
     }
   }
 

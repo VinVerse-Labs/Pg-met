@@ -67,6 +67,7 @@ const property = {
   city: 'Hyderabad',
   state: 'Telangana',
   postalCode: '500001',
+  timezone: 'Asia/Kolkata',
 };
 
 function buildFakePrisma() {

@@ -38,6 +38,7 @@ export class MyStayService {
           city: true,
           state: true,
           postalCode: true,
+          timezone: true,
         },
       },
       allocations: {

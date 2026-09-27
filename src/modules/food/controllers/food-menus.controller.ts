@@ -24,6 +24,7 @@ import { UpdateMenuItemDto } from '../dto/update-menu-item.dto';
 import { WeeklyMenuDto } from '../dto/weekly-menu.dto';
 import { ListMenusQueryDto } from '../dto/list-menus.query.dto';
 import { MenuResponseDto } from '../dto/menu-response.dto';
+import { WeekMenuQueryDto } from '../dto/week-menu.query.dto';
 
 // Every menu mutation is date-scoped to a single Menu row (spec: "do not
 // build a single mutable current menu table") - never a bulk operation
@@ -68,9 +69,13 @@ export class FoodMenusController {
   async findWeek(
     @CurrentUser() user: AuthenticatedUser,
     @Param('propertyId') propertyId: string,
-    @Query('startDate') startDate: string,
+    @Query() query: WeekMenuQueryDto,
   ): Promise<MenuResponseDto[]> {
-    return this.menusService.findWeekForProperty(user, propertyId, startDate);
+    return this.menusService.findWeekForProperty(
+      user,
+      propertyId,
+      query.startDate,
+    );
   }
 
   @Put('properties/:propertyId/food/menus/week')

@@ -1,3 +1,4 @@
+import { IsIanaTimeZone } from '../../../common/validation/calendar';
 import { ApiProperty } from '@nestjs/swagger';
 import { PropertyType } from '@prisma/client';
 import {
@@ -61,4 +62,14 @@ export class UpdatePropertyDto {
   @MinLength(3)
   @MaxLength(12)
   postalCode?: string;
+
+  @ApiProperty({
+    required: false,
+    example: 'Asia/Kolkata',
+    description:
+      'IANA timezone the property operates in; drives "today" for menus. Defaults to Asia/Kolkata.',
+  })
+  @IsOptional()
+  @IsIanaTimeZone()
+  timezone?: string;
 }

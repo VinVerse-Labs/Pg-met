@@ -27,7 +27,9 @@ import { FoodSubscriptionInvoiceResponseDto } from '../dto/food-subscription-inv
 import { MenuResponseDto } from '../dto/menu-response.dto';
 import { MyFoodResponseDto } from '../dto/my-food-response.dto';
 import { MealConsumptionResponseDto } from '../dto/meal-consumption-response.dto';
+import { WeekMenuQueryDto } from '../dto/week-menu.query.dto';
 import { AppException } from '../../../common/exceptions/app.exception';
+import { calendarDateInTimeZone } from '../../../common/validation/calendar';
 import { ErrorCode } from '../../../common/constants/error-code.enum';
 
 // The tenant-facing dashboard surface (spec sections 20/30/31/50/92) -
@@ -158,7 +160,7 @@ export class MyFoodController {
     @CurrentUser() user: AuthenticatedUser,
   ): Promise<MenuResponseDto | null> {
     const { context } = await this.entitlement.getEntitlementForCaller(user);
-    const today = new Date().toISOString().slice(0, 10);
+    const today = calendarDateInTimeZone(new Date(), context.property.timezone);
     return this.menus.findOneForDate(context.property.id, today, true);
   }
 
@@ -169,10 +171,10 @@ export class MyFoodController {
   })
   async getWeekMenu(
     @CurrentUser() user: AuthenticatedUser,
-    @Query('startDate') startDate: string,
+    @Query() query: WeekMenuQueryDto,
   ): Promise<MenuResponseDto[]> {
     const { context } = await this.entitlement.getEntitlementForCaller(user);
-    return this.menus.findWeekRows(context.property.id, startDate, true);
+    return this.menus.findWeekRows(context.property.id, query.startDate, true);
   }
 
   @Get('meals')

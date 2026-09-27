@@ -1148,6 +1148,35 @@ See `.env.example` for the full list. All of them are validated at
 startup (`src/config/env.validation.ts`); the app refuses to boot if a
 required one is missing or malformed.
 
+Production notes (Render or any host behind a proxy):
+
+- `TRUST_PROXY_HOPS=1` - without it every request appears to come from the
+  proxy, so all users share one rate-limit bucket (100 req/min).
+- `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` are two separate values;
+  `RAZORPAY_WEBHOOK_SECRET` is the secret you type into the Razorpay
+  webhook form (not the webhook URL). Webhook URL:
+  `https://<host>/api/v1/payments/webhooks/razorpay`, events
+  `payment.captured` and `payment.failed`.
+- `npm run start` runs `prisma migrate deploy` and then `node dist/main`.
+
+## Tenant Web Phase 3 additions
+
+- `Property.timezone` (IANA, default `Asia/Kolkata`, validated on
+  create/update; migration `20261026090000_phase14_property_timezone`).
+  Tenant "today" for food is computed in the property's timezone
+  (`src/common/validation/calendar.ts`); `/me/food` returns `todayDate` and
+  `timezone`.
+- Weekly menu `startDate` is validated (`WeekMenuQueryDto`): missing or
+  impossible dates are a 400, never a 500.
+- `GET /me/complaints[/:id[/comments|/activity]]`, `POST
+  /me/complaints/:id/comments|cancel` - pinned to the caller's own tenant
+  profile, tenant-safe DTOs, authors labelled `YOU` / `PROPERTY_TEAM`.
+- Payment order creation reuses the caller's open PENDING order for the
+  same amount and returns 409 `PAYMENT_IN_PROGRESS` while a payment for the
+  invoice is AUTHORIZED (30-minute bound).
+- `npm run test:e2e` runs serially (`--runInBand`): the suites boot a Nest
+  app each and timed out under parallel workers.
+
 ## Phase 1: authentication & identity architecture
 
 ### The core principle: a person is a platform user, not a PG

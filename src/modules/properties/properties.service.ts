@@ -51,6 +51,7 @@ export class PropertiesService {
         city: dto.city,
         state: dto.state,
         postalCode: dto.postalCode,
+        timezone: dto.timezone,
       },
     });
 

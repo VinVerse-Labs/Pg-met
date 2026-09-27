@@ -270,6 +270,7 @@ describe('MyStayService', () => {
       city: 'Hyderabad',
       state: 'Telangana',
       postalCode: '500001',
+      timezone: 'Asia/Kolkata',
     },
     allocations: [
       {

@@ -7,6 +7,7 @@ export const appConfig = registerAs('app', () => ({
     .split(',')
     .map((origin) => origin.trim())
     .filter((origin) => origin.length > 0),
+  trustProxyHops: parseInt(process.env.TRUST_PROXY_HOPS ?? '0', 10),
 }));
 
 export const jwtConfig = registerAs('jwt', () => ({

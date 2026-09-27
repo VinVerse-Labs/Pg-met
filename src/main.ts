@@ -21,7 +21,16 @@ async function bootstrap(): Promise<void> {
   });
 
   const configService = app.get(ConfigService);
-  const { port, nodeEnv, corsOrigins } = configService.get<AppConfig>('app')!;
+  const { port, nodeEnv, corsOrigins, trustProxyHops } =
+    configService.get<AppConfig>('app')!;
+
+  // Behind a reverse proxy the socket address is the proxy's, so without
+  // this every client would share one IP for rate limiting (ThrottlerGuard
+  // keys on req.ips/req.ip) and logs. Only the configured number of hops is
+  // trusted, so a client cannot spoof X-Forwarded-For past the proxy.
+  if (trustProxyHops > 0) {
+    app.getHttpAdapter().getInstance().set('trust proxy', trustProxyHops);
+  }
 
   app.use(helmet());
   app.use(compression());

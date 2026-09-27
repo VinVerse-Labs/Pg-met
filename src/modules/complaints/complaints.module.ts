@@ -14,6 +14,9 @@ import { ComplaintCommentsService } from './complaint-comments.service';
 import { ComplaintAttachmentsService } from './complaint-attachments.service';
 import { ComplaintActivityService } from './complaint-activity.service';
 
+import { MyComplaintsController } from './my-complaints.controller';
+import { MyComplaintsService } from './my-complaints.service';
+
 @Module({
   imports: [
     AuthModule,
@@ -27,6 +30,7 @@ import { ComplaintActivityService } from './complaint-activity.service';
     ComplaintCommentsController,
     ComplaintAttachmentsController,
     AdminComplaintsController,
+    MyComplaintsController,
   ],
   providers: [
     ComplaintsService,
@@ -34,6 +38,7 @@ import { ComplaintActivityService } from './complaint-activity.service';
     ComplaintCommentsService,
     ComplaintAttachmentsService,
     ComplaintActivityService,
+    MyComplaintsService,
   ],
 })
 export class ComplaintsModule {}

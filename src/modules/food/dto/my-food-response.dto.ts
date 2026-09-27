@@ -40,6 +40,16 @@ export class MyFoodResponseDto {
   @ApiProperty()
   enabled!: boolean;
 
+  @ApiProperty({
+    example: '2026-09-21',
+    description:
+      "Today's calendar date at the property (its own timezone) - the anchor for 'today' and menu weeks.",
+  })
+  todayDate!: string;
+
+  @ApiProperty({ example: 'Asia/Kolkata' })
+  timezone!: string;
+
   @ApiProperty({ type: FoodEntitlementResponseDto })
   entitlement!: FoodEntitlementResponseDto;
 

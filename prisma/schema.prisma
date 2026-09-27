@@ -716,6 +716,12 @@ model Property {
   state          String
   postalCode     String
   status         PropertyStatus @default(ACTIVE)
+  // IANA timezone the property operates in. Every tenant-visible calendar
+  // date at this property ("today's menu", menu weeks) is derived in this
+  // zone, never in UTC. The default only backfills existing rows (all of
+  // which are Indian properties) and applies when a creator omits it -
+  // it is per-property, not a platform-wide assumption.
+  timezone       String         @default("Asia/Kolkata")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

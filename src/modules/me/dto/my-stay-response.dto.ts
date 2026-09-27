@@ -19,6 +19,12 @@ export class MyStayPropertyDto {
   @ApiProperty() city!: string;
   @ApiProperty() state!: string;
   @ApiProperty() postalCode!: string;
+  @ApiProperty({
+    example: 'Asia/Kolkata',
+    description:
+      'IANA timezone; calendar dates at this property are local to it.',
+  })
+  timezone!: string;
 }
 
 export class MyStayRoomDto {

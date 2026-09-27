@@ -32,6 +32,9 @@ export class PropertyResponseDto {
   @ApiProperty({ enum: PropertyStatus })
   status!: PropertyStatus;
 
+  @ApiProperty({ example: 'Asia/Kolkata' })
+  timezone!: string;
+
   @ApiProperty()
   createdAt!: Date;
 
@@ -47,6 +50,7 @@ export class PropertyResponseDto {
     dto.state = property.state;
     dto.postalCode = property.postalCode;
     dto.status = property.status;
+    dto.timezone = property.timezone;
     dto.createdAt = property.createdAt;
     return dto;
   }

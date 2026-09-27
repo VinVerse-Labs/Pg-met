@@ -38,6 +38,10 @@ type InvoiceWithTenantAndOrg = Invoice & {
   residency: Residency & { tenant: Tenant; organizationId: string };
 };
 
+// How long an AUTHORIZED (captured-pending) payment blocks a new order for
+// the same invoice. Bounded so a lost webhook can never lock a tenant out.
+const AUTHORIZED_HOLD_MS = 30 * 60 * 1000;
+
 @Injectable()
 export class PaymentsService {
   private readonly logger = new Logger(PaymentsService.name);
@@ -75,6 +79,15 @@ export class PaymentsService {
             HttpStatus.CONFLICT,
           );
         }
+        if (!existing.providerOrderId) {
+          // That attempt never got a gateway order (see the catch below):
+          // replaying it would hand the client an empty order id.
+          throw new AppException(
+            ErrorCode.PAYMENT_GATEWAY_ERROR,
+            'This payment attempt could not be started. Please try again.',
+            HttpStatus.BAD_GATEWAY,
+          );
+        }
         return this.toOrderResponse(existing);
       }
     }
@@ -105,6 +118,39 @@ export class PaymentsService {
         `Requested amount exceeds the outstanding balance of ${outstanding.toString()}.`,
         HttpStatus.CONFLICT,
       );
+    }
+
+    // Duplicate-attempt guard (the Idempotency-Key only covers a retry of
+    // the *same* attempt; a second tab or a fresh attempt sends a new key).
+    // A payment the gateway has already authorized is still settling - a
+    // second order now could charge the tenant twice, and the later capture
+    // would only be rejected as OVERPAYMENT after the money moved. An
+    // unpaid open order for the same amount is simply handed back, so the
+    // tenant keeps paying against one order instead of accumulating many.
+    const openPayment = await this.prisma.payment.findFirst({
+      where: {
+        invoiceId: invoice.id,
+        payerUserId: user.id,
+        status: { in: ['PENDING', 'AUTHORIZED'] },
+        providerOrderId: { not: null },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (
+      openPayment?.status === 'AUTHORIZED' &&
+      Date.now() - openPayment.updatedAt.getTime() < AUTHORIZED_HOLD_MS
+    ) {
+      throw new AppException(
+        ErrorCode.PAYMENT_IN_PROGRESS,
+        'A payment for this invoice is already being confirmed. Please refresh in a few minutes.',
+        HttpStatus.CONFLICT,
+      );
+    }
+    if (
+      openPayment?.status === 'PENDING' &&
+      openPayment.amount.equals(requestedAmount)
+    ) {
+      return this.toOrderResponse(openPayment);
     }
 
     const platformFee = await this.platformFee.calculateFee(requestedAmount);
@@ -142,12 +188,28 @@ export class PaymentsService {
       throw error;
     }
 
-    const order = await this.gateway.createOrder({
-      amountInSmallestUnit: decimalToSmallestUnit(requestedAmount),
-      currency: invoice.currency,
-      receipt: payment.id,
-      notes: { invoiceId: invoice.id, residencyId: invoice.residencyId },
-    });
+    let order: { providerOrderId: string };
+    try {
+      order = await this.gateway.createOrder({
+        amountInSmallestUnit: decimalToSmallestUnit(requestedAmount),
+        currency: invoice.currency,
+        receipt: payment.id,
+        notes: { invoiceId: invoice.id, residencyId: invoice.residencyId },
+      });
+    } catch (error) {
+      // No order exists at the gateway, so nothing can ever be paid against
+      // this row: close it instead of leaving an orphan CREATED payment in the
+      // tenant's history ("Started" forever). A retry needs a new attempt.
+      await this.prisma.payment.update({
+        where: { id: payment.id },
+        data: {
+          status: 'FAILED',
+          failureCode: 'GATEWAY_ORDER_FAILED',
+          failureMessage: 'The payment could not be started. Please try again.',
+        },
+      });
+      throw error;
+    }
 
     payment = await this.prisma.payment.update({
       where: { id: payment.id },
