@@ -41,6 +41,7 @@ import { ComplaintsModule } from './modules/complaints/complaints.module';
 import { FoodModule } from './modules/food/food.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { TenantDiscoveryModule } from './modules/tenant-discovery/tenant-discovery.module';
+import { MeModule } from './modules/me/me.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { RequestIdMiddleware } from './common/middleware/request-id.middleware';
@@ -96,6 +97,7 @@ import { HttpStatus } from '@nestjs/common';
     FoodModule,
     NotificationsModule,
     TenantDiscoveryModule,
+    MeModule,
   ],
   providers: [
     {

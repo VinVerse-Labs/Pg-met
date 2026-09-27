@@ -86,7 +86,8 @@ export class MyFoodController {
 
   @Get('subscription')
   @ApiOperation({
-    summary: 'The caller’s own active food subscription, or null.',
+    summary:
+      'The caller’s own current food subscription (ACTIVE or PAUSED), or null.',
   })
   async getSubscription(
     @CurrentUser() user: AuthenticatedUser,

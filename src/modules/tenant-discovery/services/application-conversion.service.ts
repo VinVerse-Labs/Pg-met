@@ -6,6 +6,7 @@ import { UsersService } from '../../users/users.service';
 import { AuthenticatedUser } from '../../auth/strategies/jwt.strategy';
 import { TenantApplicationsService } from './tenant-applications.service';
 import { ConversionResponseDto } from '../dto/conversion-response.dto';
+import { tenantCodeFromId } from '../../tenants/tenant-code';
 
 const REVIEW_ROLES = ['OWNER', 'MANAGER'] as const;
 
@@ -146,6 +147,11 @@ export class ApplicationConversionService {
     this.logger.log(
       `APPLICATION_ONBOARDING_STARTED application=${applicationId} tenant=${result.tenantId} by=${user.id}`,
     );
-    return { tenantId: result.tenantId, applicationId, reused: result.reused };
+    return {
+      tenantId: result.tenantId,
+      tenantCode: tenantCodeFromId(result.tenantId),
+      applicationId,
+      reused: result.reused,
+    };
   }
 }

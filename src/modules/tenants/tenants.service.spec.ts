@@ -40,7 +40,7 @@ describe('TenantsService', () => {
   describe('createForSelf', () => {
     it('creates a tenant with userId always taken from the authenticated caller', async () => {
       prisma.tenant.create.mockResolvedValue({
-        id: 'tenant-1',
+        id: 'd4444444-4444-4444-8444-444444444444',
         userId: 'user-1',
         createdAt: new Date(),
       });
@@ -65,47 +65,53 @@ describe('TenantsService', () => {
 
     it("allows the tenant's own user to read it", async () => {
       prisma.tenant.findUnique.mockResolvedValue({
-        id: 'tenant-1',
+        id: 'd4444444-4444-4444-8444-444444444444',
         userId: 'user-1',
         createdAt: new Date(),
       });
 
-      const result = await service.findOne(buildUser(), 'tenant-1');
+      const result = await service.findOne(
+        buildUser(),
+        'd4444444-4444-4444-8444-444444444444',
+      );
 
-      expect(result.id).toBe('tenant-1');
+      expect(result.id).toBe('d4444444-4444-4444-8444-444444444444');
       expect(memberships.listActiveOrganizationIds).not.toHaveBeenCalled();
     });
 
     it('allows a SUPER_ADMIN to read any tenant', async () => {
       prisma.tenant.findUnique.mockResolvedValue({
-        id: 'tenant-1',
+        id: 'd4444444-4444-4444-8444-444444444444',
         userId: 'someone-else',
         createdAt: new Date(),
       });
 
       const result = await service.findOne(
         buildUser({ platformRole: 'SUPER_ADMIN' }),
-        'tenant-1',
+        'd4444444-4444-4444-8444-444444444444',
       );
 
-      expect(result.id).toBe('tenant-1');
+      expect(result.id).toBe('d4444444-4444-4444-8444-444444444444');
     });
 
     it('allows an org member who shares a residency with this tenant', async () => {
       prisma.tenant.findUnique.mockResolvedValue({
-        id: 'tenant-1',
+        id: 'd4444444-4444-4444-8444-444444444444',
         userId: 'someone-else',
         createdAt: new Date(),
       });
       memberships.listActiveOrganizationIds.mockResolvedValue(['org-1']);
       prisma.residency.findFirst.mockResolvedValue({ id: 'res-1' });
 
-      const result = await service.findOne(buildUser(), 'tenant-1');
+      const result = await service.findOne(
+        buildUser(),
+        'd4444444-4444-4444-8444-444444444444',
+      );
 
-      expect(result.id).toBe('tenant-1');
+      expect(result.id).toBe('d4444444-4444-4444-8444-444444444444');
       expect(prisma.residency.findFirst).toHaveBeenCalledWith({
         where: {
-          tenantId: 'tenant-1',
+          tenantId: 'd4444444-4444-4444-8444-444444444444',
           property: { organizationId: { in: ['org-1'] } },
         },
       });
@@ -113,7 +119,7 @@ describe('TenantsService', () => {
 
     it('rejects (404, hiding existence) an unrelated caller with no shared residency', async () => {
       prisma.tenant.findUnique.mockResolvedValue({
-        id: 'tenant-1',
+        id: 'd4444444-4444-4444-8444-444444444444',
         userId: 'someone-else',
         createdAt: new Date(),
       });
@@ -121,7 +127,7 @@ describe('TenantsService', () => {
       prisma.residency.findFirst.mockResolvedValue(null);
 
       await expect(
-        service.findOne(buildUser(), 'tenant-1'),
+        service.findOne(buildUser(), 'd4444444-4444-4444-8444-444444444444'),
       ).rejects.toMatchObject({ code: ErrorCode.TENANT_NOT_FOUND });
     });
   });
@@ -137,13 +143,15 @@ describe('TenantsService', () => {
 
     it('returns the tenant when it exists, without any access check', async () => {
       const tenant = {
-        id: 'tenant-1',
+        id: 'd4444444-4444-4444-8444-444444444444',
         userId: 'user-9',
         createdAt: new Date(),
       };
       prisma.tenant.findUnique.mockResolvedValue(tenant);
 
-      await expect(service.assertExists('tenant-1')).resolves.toBe(tenant);
+      await expect(
+        service.assertExists('d4444444-4444-4444-8444-444444444444'),
+      ).resolves.toBe(tenant);
     });
   });
 });

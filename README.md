@@ -3953,3 +3953,29 @@ with conflict detection, an explicit and separate application-to-tenant
 conversion step that never auto-creates a Residency, eight new
 notification integrations, and the codebase's first genuinely public,
 unguarded HTTP surface).
+
+
+## Phase 13 - Tenant self-service reads (for Tenant Web Phase 2)
+
+New read-only `MeModule` (`src/modules/me`), every route caller-scoped (no tenant/residency id is
+ever accepted from the client):
+
+| Route | Returns |
+| --- | --- |
+| `GET /me/residency` | The caller's current stay (ACTIVE / NOTICE_PERIOD, else an upcoming PENDING one) with property, room, bed and ACTIVE rent plan; `null` when there is none. |
+| `GET /me/rent` | Outstanding balance per currency, open/overdue counts, the next payable invoice. |
+| `GET /me/invoices` (`page`, `limit`, `status`) | The caller's invoices, never DRAFT, newest billing period first, each with server-computed `amountPaid`, `balanceDue` and `isPayable` (from PaymentAllocation, in Decimal). |
+| `GET /me/invoices/:id` | One invoice with line items and the caller's payments on it. 404 for anyone else's (or a DRAFT). |
+| `GET /me/payments` | The caller's rent payments. Tenant-safe fields only: no platform fee, owner settlement or internal ids. |
+
+All money fields are 2-decimal strings (`toFixed(2)`). Paying still uses the existing
+`POST /invoices/:invoiceId/payments/order` and `POST /payments/:id/verify`.
+
+Also changed: `GET /me/food/subscription` now returns the caller's ACTIVE **or PAUSED**
+subscription (a paused plan was invisible, so it couldn't be resumed), and `POST
+/me/food/subscriptions` rejects with `FOOD_SUBSCRIPTION_ALREADY_ACTIVE` when an ACTIVE or PAUSED one
+exists. No migrations.
+
+Tests: `src/modules/me/services/me-services.spec.ts` (scoping, decimal exactness, DRAFT exclusion,
+tenant-safe payment fields), `test/phase13-tenant-self-service.e2e-spec.ts` (HTTP: 401s, whitelist
+400s, null stay envelope, cross-tenant 404s), and new cases in `food-subscriptions.service.spec.ts`.

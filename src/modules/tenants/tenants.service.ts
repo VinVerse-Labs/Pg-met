@@ -6,6 +6,10 @@ import { ErrorCode } from '../../common/constants/error-code.enum';
 import { MembershipsService } from '../memberships/memberships.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { TenantResponseDto } from './dto/tenant-response.dto';
+import { TenantLookupResponseDto } from './dto/tenant-lookup-response.dto';
+import { idPrefixFromTenantCode, tenantCodeFromId } from './tenant-code';
+
+const LOOKUP_ROLES = ['OWNER', 'MANAGER'] as const;
 
 // Deliberately minimal: Phase 4's spec explicitly says "if Tenant requires
 // HTTP APIs, keep them minimal" and warns against adding fields/endpoints
@@ -73,6 +77,74 @@ export class TenantsService {
     }
 
     throw this.notFound();
+  }
+
+  // The caller's own tenant profile (GET /me/tenant) - how a tenant finds
+  // the code to give a property team at check-in. 404 when they have none
+  // yet (created by POST /tenants, or by an owner's start-onboarding).
+  async findMine(user: AuthenticatedUser): Promise<TenantResponseDto> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { userId: user.id },
+    });
+    if (!tenant) {
+      throw this.notFound();
+    }
+    return TenantResponseDto.fromEntity(tenant);
+  }
+
+  // Resolves a tenant code (TN-XXXX-XXXX) for an OWNER/MANAGER about to
+  // check someone in - the same people who may already create a residency
+  // for any existing tenantId (see assertExists below), so this grants no
+  // new capability, it only swaps an unreadable UUID for a short code.
+  // Anyone without an OWNER/MANAGER membership gets the same 404 as an
+  // unknown code, so the endpoint can't be used to probe codes.
+  async lookupByCode(
+    user: AuthenticatedUser,
+    code: string,
+  ): Promise<TenantLookupResponseDto> {
+    if (user.platformRole !== 'SUPER_ADMIN') {
+      const membership = await this.prisma.organizationMembership.findFirst({
+        where: {
+          userId: user.id,
+          status: 'ACTIVE',
+          role: { in: [...LOOKUP_ROLES] },
+        },
+        select: { id: true },
+      });
+      if (!membership) {
+        throw this.notFound();
+      }
+    }
+
+    const prefix = idPrefixFromTenantCode(code);
+    if (!prefix) {
+      throw new AppException(
+        ErrorCode.VALIDATION_FAILED,
+        'Enter a tenant code like TN-3K7Q-9XZ2.',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    const matches = await this.prisma.tenant.findMany({
+      where: { id: { startsWith: prefix } },
+      select: { id: true, user: { select: { name: true } } },
+      take: 2,
+    });
+    if (matches.length === 0) {
+      throw this.notFound();
+    }
+    if (matches.length > 1) {
+      throw new AppException(
+        ErrorCode.TENANT_CODE_AMBIGUOUS,
+        'This code matches more than one tenant. Use the full tenant ID instead.',
+        HttpStatus.CONFLICT,
+      );
+    }
+    const [tenant] = matches;
+    const dto = new TenantLookupResponseDto();
+    dto.tenantId = tenant.id;
+    dto.code = tenantCodeFromId(tenant.id);
+    dto.name = tenant.user.name;
+    return dto;
   }
 
   // Internal reuse seam for ResidenciesService.create - "does this tenant

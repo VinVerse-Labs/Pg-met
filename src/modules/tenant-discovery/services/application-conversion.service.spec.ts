@@ -2,6 +2,7 @@ import { AuthenticatedUser } from '../../auth/strategies/jwt.strategy';
 import { ErrorCode } from '../../../common/constants/error-code.enum';
 import { UsersService } from '../../users/users.service';
 import { TenantApplicationsService } from './tenant-applications.service';
+import { tenantCodeFromId } from '../../tenants/tenant-code';
 import { ApplicationConversionService } from './application-conversion.service';
 
 function buildUser(
@@ -78,18 +79,19 @@ describe('ApplicationConversionService', () => {
     applications.getOrgApplicationOrThrow.mockResolvedValue(buildApplication());
     tx.tenantApplication.updateMany.mockResolvedValue({ count: 1 });
     tx.tenant.findUnique.mockResolvedValue({
-      id: 'tenant-existing',
+      id: 'a1111111-1111-4111-8111-111111111111',
       userId: 'applicant-1',
     });
     tx.tenant.upsert.mockResolvedValue({
-      id: 'tenant-existing',
+      id: 'a1111111-1111-4111-8111-111111111111',
       userId: 'applicant-1',
     });
 
     const result = await service.startOnboarding(buildUser(), 'app-1');
 
     expect(result).toEqual({
-      tenantId: 'tenant-existing',
+      tenantId: 'a1111111-1111-4111-8111-111111111111',
+      tenantCode: tenantCodeFromId('a1111111-1111-4111-8111-111111111111'),
       applicationId: 'app-1',
       reused: true,
     });
@@ -104,7 +106,7 @@ describe('ApplicationConversionService', () => {
     users.create.mockResolvedValue({ id: 'new-user-1' });
     tx.tenant.findUnique.mockResolvedValue(null);
     tx.tenant.upsert.mockResolvedValue({
-      id: 'tenant-new',
+      id: 'b2222222-2222-4222-8222-222222222222',
       userId: 'new-user-1',
     });
 
@@ -114,7 +116,8 @@ describe('ApplicationConversionService', () => {
       expect.objectContaining({ phone: '+911234567890' }),
     );
     expect(result).toEqual({
-      tenantId: 'tenant-new',
+      tenantId: 'b2222222-2222-4222-8222-222222222222',
+      tenantCode: tenantCodeFromId('b2222222-2222-4222-8222-222222222222'),
       applicationId: 'app-1',
       reused: false,
     });
@@ -126,14 +129,15 @@ describe('ApplicationConversionService', () => {
     // committed its transaction before this one acquired the lock.
     tx.tenantApplication.updateMany.mockResolvedValue({ count: 0 });
     tx.tenant.findUniqueOrThrow.mockResolvedValue({
-      id: 'tenant-winner',
+      id: 'c3333333-3333-4333-8333-333333333333',
       userId: 'applicant-1',
     });
 
     const result = await service.startOnboarding(buildUser(), 'app-1');
 
     expect(result).toEqual({
-      tenantId: 'tenant-winner',
+      tenantId: 'c3333333-3333-4333-8333-333333333333',
+      tenantCode: tenantCodeFromId('c3333333-3333-4333-8333-333333333333'),
       applicationId: 'app-1',
       reused: true,
     });

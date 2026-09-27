@@ -183,6 +183,32 @@ describe('FoodSubscriptionsService', () => {
       });
     });
 
+    it('treats a PAUSED subscription as existing too (no second plan beside a paused one)', async () => {
+      foodConfiguration.getOrCreate.mockResolvedValue({
+        enabled: true,
+        optionalSubscriptionEnabled: true,
+      });
+      prisma.foodPlan.findFirst.mockResolvedValue(activePlan);
+      prisma.tenantFoodSubscription.findFirst.mockResolvedValue({
+        id: 'paused-one',
+        status: 'PAUSED',
+      });
+
+      await expect(
+        service.subscribe(buildUser(), { foodPlanId: 'plan-1' }),
+      ).rejects.toMatchObject({
+        code: ErrorCode.FOOD_SUBSCRIPTION_ALREADY_ACTIVE,
+      });
+      expect(prisma.tenantFoodSubscription.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { in: ['ACTIVE', 'PAUSED'] },
+          }),
+        }),
+      );
+      expect(prisma.tenantFoodSubscription.create).not.toHaveBeenCalled();
+    });
+
     it('translates a lost concurrency race (unique violation) into the same conflict', async () => {
       foodConfiguration.getOrCreate.mockResolvedValue({
         enabled: true,
@@ -325,6 +351,37 @@ describe('FoodSubscriptionsService', () => {
         expect.objectContaining({
           where: { residencyId: 'res-1', status: { in: ['ACTIVE', 'PAUSED'] } },
           data: expect.objectContaining({ status: 'EXPIRED' }),
+        }),
+      );
+    });
+  });
+  describe('findMyActive', () => {
+    it('returns a PAUSED subscription so the tenant can see and resume it', async () => {
+      prisma.tenantFoodSubscription.findFirst.mockResolvedValue({
+        id: 'sub-1',
+        organizationId: 'org-1',
+        propertyId: 'property-1',
+        tenantId: 'tenant-1',
+        residencyId: 'residency-1',
+        foodPlanId: 'plan-1',
+        status: 'PAUSED',
+        startDate: new Date('2026-09-01'),
+        endDate: null,
+        priceSnapshot: new Prisma.Decimal('1500.00'),
+        currency: 'INR',
+        mealTypesSnapshot: ['LUNCH'],
+        createdAt: new Date('2026-09-01'),
+        updatedAt: new Date('2026-09-01'),
+      });
+
+      const result = await service.findMyActive(buildUser());
+
+      expect(result?.status).toBe('PAUSED');
+      expect(prisma.tenantFoodSubscription.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { in: ['ACTIVE', 'PAUSED'] },
+          }),
         }),
       );
     });

@@ -92,13 +92,21 @@ export class FoodSubscriptionsService {
       );
     }
 
+    // A PAUSED subscription still belongs to the residency (it can be
+    // resumed), so it blocks a new one exactly like an ACTIVE one does -
+    // otherwise a tenant could hold a paused plan plus a new active plan,
+    // and resuming the first would then collide with
+    // food_subscriptions_active_residency_unique.
     const existingActive = await this.prisma.tenantFoodSubscription.findFirst({
-      where: { residencyId: context.residency.id, status: 'ACTIVE' },
+      where: {
+        residencyId: context.residency.id,
+        status: { in: ['ACTIVE', 'PAUSED'] },
+      },
     });
     if (existingActive) {
       throw new AppException(
         ErrorCode.FOOD_SUBSCRIPTION_ALREADY_ACTIVE,
-        'This residency already has an active food subscription.',
+        'This residency already has a food subscription (active or paused).',
         HttpStatus.CONFLICT,
       );
     }
@@ -177,12 +185,20 @@ export class FoodSubscriptionsService {
     return FoodSubscriptionResponseDto.fromEntity(subscription);
   }
 
+  // The caller's current subscription - ACTIVE *or* PAUSED (both are
+  // non-terminal and are what pause/resume/cancel act on). Returning only
+  // ACTIVE made a paused plan invisible to the tenant, hiding the resume
+  // action entirely.
   async findMyActive(
     user: AuthenticatedUser,
   ): Promise<FoodSubscriptionResponseDto | null> {
     const context = await this.entitlement.getCallerResidencyContext(user);
     const subscription = await this.prisma.tenantFoodSubscription.findFirst({
-      where: { residencyId: context.residency.id, status: 'ACTIVE' },
+      where: {
+        residencyId: context.residency.id,
+        status: { in: ['ACTIVE', 'PAUSED'] },
+      },
+      orderBy: { createdAt: 'desc' },
     });
     return subscription
       ? FoodSubscriptionResponseDto.fromEntity(subscription)

@@ -4,6 +4,7 @@ import { MembershipsModule } from '../memberships/memberships.module';
 import { SubscriptionsModule } from '../subscriptions/subscriptions.module';
 import { PlatformAdminModule } from '../platform-admin/platform-admin.module';
 import { UsersModule } from '../users/users.module';
+import { AuditLogModule } from '../audit-log/audit-log.module';
 import { PropertyListingsController } from './controllers/property-listings.controller';
 import { PublicPropertiesController } from './controllers/public-properties.controller';
 import { ApplicationsController } from './controllers/applications.controller';
@@ -14,6 +15,7 @@ import {
   MyVisitsController,
 } from './controllers/my-visits.controller';
 import { AdminDiscoveryController } from './controllers/admin-discovery.controller';
+import { AdminListingsController } from './controllers/admin-listings.controller';
 import { PropertyListingsService } from './services/property-listings.service';
 import { PublicDiscoveryService } from './services/public-discovery.service';
 import { TenantApplicationsService } from './services/tenant-applications.service';
@@ -21,6 +23,7 @@ import { ApplicationLifecycleService } from './services/application-lifecycle.se
 import { ApplicationConversionService } from './services/application-conversion.service';
 import { ApplicationActivityService } from './services/application-activity.service';
 import { PropertyVisitsService } from './services/property-visits.service';
+import { AdminListingsService } from './services/admin-listings.service';
 
 // The tenant ACQUISITION funnel - deliberately never imports
 // ResidenciesModule/InvoicesModule/PaymentsModule back (spec's mandatory
@@ -38,6 +41,7 @@ import { PropertyVisitsService } from './services/property-visits.service';
     SubscriptionsModule,
     PlatformAdminModule,
     UsersModule,
+    AuditLogModule,
   ],
   controllers: [
     PropertyListingsController,
@@ -48,6 +52,7 @@ import { PropertyVisitsService } from './services/property-visits.service';
     MyVisitsController,
     MyApplicationVisitsController,
     AdminDiscoveryController,
+    AdminListingsController,
   ],
   providers: [
     PropertyListingsService,
@@ -57,6 +62,7 @@ import { PropertyVisitsService } from './services/property-visits.service';
     ApplicationConversionService,
     ApplicationActivityService,
     PropertyVisitsService,
+    AdminListingsService,
   ],
   exports: [TenantApplicationsService, PropertyVisitsService],
 })
